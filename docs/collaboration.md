@@ -28,6 +28,12 @@ Auth: `Authorization: Bearer <Auth0 JWT>` (web), or `X-Internal-Secret` (CLI/MCP
 
 Permission failures come back as `403 { error }` (not allowed) or `404 { error }` (not visible), with readable messages such as `You have view-only access to "Solfit"`.
 
+### Personal access tokens (CLI and MCP)
+- People sign in to the CLI with `bin/timdo login`. It takes a personal token (`tdo_...`) created on the web app's **CLI & MCP** page (`/settings/access`), and the MCP server in `mcp/` uses the same login.
+- A token acts only as the person who made it. It sends `Authorization: Bearer tdo_...`, and asking to act as anyone else (`X-Timdo-User`) is refused with 403. Tokens are stored hashed, shown once, and can be revoked at any time.
+- `GET /users/me/tokens`, `POST /users/me/tokens` `{ name }` (from a signed-in browser session only, so a token can't mint more), `DELETE /users/me/tokens/:id`.
+- The owner's internal secret (`X-Internal-Secret`) is for the account owner's own tooling only, and is the only way to act as someone else.
+
 ### Who am I
 - `GET /users/me` returns `{ id, email, name }`.
 

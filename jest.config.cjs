@@ -6,7 +6,7 @@ const createJestConfig = nextJest({
 
 const customJestConfig = {
   setupFilesAfterEnv: ['<rootDir>/jest.setup.cjs'],
-  testPathIgnorePatterns: ['<rootDir>/workers/', '<rootDir>/e2e/', '<rootDir>/.claude/'],
+  testPathIgnorePatterns: ['<rootDir>/workers/', '<rootDir>/e2e/', '<rootDir>/.claude/', '<rootDir>/mcp/'],
   transformIgnorePatterns: ['node_modules/(?!(next-auth|marked|dompurify)/)'],
   moduleNameMapper: {
     '^marked$': '<rootDir>/node_modules/marked/lib/marked.umd.js',

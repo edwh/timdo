@@ -1,6 +1,7 @@
 import type { Context, Next } from 'hono';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
 import type { Env } from '../index';
+import { isPersonalToken, resolveToken } from '../services/tokenService';
 
 export async function authMiddleware(c: Context<{ Bindings: Env }>, next: Next) {
   console.log(`[Auth Middleware] Triggered for ${c.req.method} ${c.req.path}`);
@@ -72,10 +73,40 @@ export async function authMiddleware(c: Context<{ Bindings: Env }>, next: Next) 
 
 export async function internalAuthMiddleware(c: Context<{ Bindings: Env }>, next: Next) {
   const internalSecret = c.req.header('X-Internal-Secret');
-  if (internalSecret !== c.env.INTERNAL_API_SECRET) {
+  // Fail closed if the secret isn't configured (undefined === undefined would let anyone in)
+  if (!c.env.INTERNAL_API_SECRET || internalSecret !== c.env.INTERNAL_API_SECRET) {
     return c.json({ error: 'Forbidden' }, 403);
   }
   await next();
+}
+
+/**
+ * CLI/MCP personal access token: acts only as its owner, never as anyone else.
+ */
+async function personalTokenAuth(c: Context<{ Bindings: Env }>, next: Next, token: string) {
+  const db = c.get('db');
+  const resolved = await resolveToken(db, token);
+  if (!resolved) {
+    return c.json({ error: 'This token is invalid or has been revoked' }, 401);
+  }
+  const { userId } = resolved;
+  const asEmail = c.req.header('X-Timdo-User')?.trim().toLowerCase();
+  if (asEmail) {
+    const { users } = await import('../db/schema');
+    const { eq } = await import('drizzle-orm');
+    const me = await db
+      .select({ email: users.email })
+      .from(users)
+      .where(eq(users.id, userId))
+      .get();
+    if (me?.email.toLowerCase() !== asEmail) {
+      return c.json({ error: 'A personal token can only act as its owner' }, 403);
+    }
+  }
+  c.set('userId', userId);
+  c.set('authMethod', 'token');
+  c.set('tokenId', resolved.tokenId);
+  return next();
 }
 
 export async function combinedAuthMiddleware(c: Context<{ Bindings: Env }>, next: Next) {
@@ -83,11 +114,19 @@ export async function combinedAuthMiddleware(c: Context<{ Bindings: Env }>, next
   const internalSecret = c.req.header('X-Internal-Secret');
 
   if (authHeader?.startsWith('Bearer ')) {
+    const bearer = authHeader.substring(7).trim();
+    if (isPersonalToken(bearer)) {
+      return personalTokenAuth(c, next, bearer);
+    }
+    if (c.req.header('X-Timdo-User')) {
+      return c.json({ error: 'Acting as another user needs the owner secret' }, 403);
+    }
+    c.set('authMethod', 'jwt');
     return authMiddleware(c, next);
   }
 
   if (internalSecret) {
-    if (internalSecret !== c.env.INTERNAL_API_SECRET) {
+    if (!c.env.INTERNAL_API_SECRET || internalSecret !== c.env.INTERNAL_API_SECRET) {
       return c.json({ error: 'Forbidden', message: 'Invalid internal secret' }, 403);
     }
 
@@ -106,6 +145,7 @@ export async function combinedAuthMiddleware(c: Context<{ Bindings: Env }>, next
     }
 
     c.set('userId', user.id);
+    c.set('authMethod', 'internal');
     return next();
   }
 

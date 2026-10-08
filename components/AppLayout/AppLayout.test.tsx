@@ -58,4 +58,14 @@ describe('AppLayout', () => {
     expect(screen.getByText('Sharing').closest('a')).toHaveAttribute('href', '/sharing');
     expect(screen.getByText('Activity').closest('a')).toHaveAttribute('href', '/activity');
   });
+
+  it('links to the CLI and MCP access page', () => {
+    render(
+      <AppLayout>
+        <div>Content</div>
+      </AppLayout>
+    );
+
+    expect(screen.getByText('CLI & MCP').closest('a')).toHaveAttribute('href', '/settings/access');
+  });
 });

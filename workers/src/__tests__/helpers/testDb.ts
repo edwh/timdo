@@ -16,7 +16,7 @@ type DatabaseSync = any;
 
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'live-schema.sql');
 const MIGRATIONS = path.join(__dirname, '..', '..', '..', 'migrations');
-const PENDING_MIGRATIONS = ['0006_collaboration.sql'];
+const PENDING_MIGRATIONS = ['0006_collaboration.sql', '0007_api_tokens.sql'];
 
 export const TIM = 'user-tim';
 export const ROBIN = 'user-robin';

@@ -248,3 +248,17 @@ export const tasksFts = sqliteTable('Tasks_FTS', {
   tags: text('tags'),
   updateNotes: text('update_notes'),
 });
+
+// Personal access tokens for the CLI/MCP; only the SHA-256 hash is stored
+export const apiTokens = sqliteTable('ApiTokens', {
+  id: text('id').primaryKey(),
+  userId: text('user_id')
+    .notNull()
+    .references(() => users.id, { onDelete: 'cascade' }),
+  name: text('name').notNull(),
+  tokenHash: text('token_hash').notNull().unique(),
+  prefix: text('prefix').notNull(),
+  createdAt: text('created_at').default(sql`CURRENT_TIMESTAMP`),
+  lastUsedAt: text('last_used_at'),
+  revokedAt: text('revoked_at'),
+});

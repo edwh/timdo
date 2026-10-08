@@ -9,6 +9,7 @@ set -euo pipefail
 # talks to a local API even when ~/.config/timdo/config holds the production secret.
 # ---------------------------------------------------------------------------
 _env_secret="${TIMDO_SECRET:-}"
+_env_token="${TIMDO_TOKEN:-}"
 _env_api="${TIMDO_API:-}"
 _env_as="${TIMDO_AS:-}"
 TIMDO_CONFIG="${TIMDO_CONFIG:-$HOME/.config/timdo/config}"
@@ -17,6 +18,8 @@ if [[ -f "$TIMDO_CONFIG" ]]; then
   source "$TIMDO_CONFIG"
 fi
 [[ -n "$_env_secret" ]] && TIMDO_SECRET="$_env_secret"
+[[ -n "$_env_token" ]] && TIMDO_TOKEN="$_env_token"
+TIMDO_TOKEN="${TIMDO_TOKEN:-}"
 [[ -n "$_env_api" ]] && TIMDO_API="$_env_api"
 [[ -n "$_env_as" ]] && TIMDO_AS="$_env_as"
 TIMDO_API="${TIMDO_API:-https://timdo-v2-api.tdobson.net/api/v2}"
@@ -175,10 +178,11 @@ $prog"
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
-require_secret() {
-  if [[ -z "${TIMDO_SECRET:-}" ]]; then
-    echo "Error: TIMDO_SECRET not set. Either export it or add it to $TIMDO_CONFIG" >&2
-    echo "  echo 'TIMDO_SECRET=\"your-secret\"' > $TIMDO_CONFIG" >&2
+# Credentials: a personal token (from `timdo login`) acts as you; the owner's internal
+# secret (TIMDO_SECRET) is for the account owner's own tooling only.
+require_credentials() {
+  if [[ -z "$TIMDO_TOKEN" && -z "${TIMDO_SECRET:-}" ]]; then
+    echo "Not logged in. Create a token at $APP_URL/settings/access, then run: timdo login" >&2
     exit 1
   fi
 }
@@ -211,6 +215,9 @@ api_error() {
     400|422) prefix="Invalid request" ;;
     *) prefix="Error ($code)" ;;
   esac
+  if [[ "$msg" == *"invalid or has been revoked"* ]]; then
+    die "Not signed in: your token was rejected (revoked or mistyped). Create a new one at $APP_URL/settings/access and run: timdo login"
+  fi
   if [[ "$msg" == *"Invalid internal secret"* ]]; then
     die "Not signed in: the API rejected TIMDO_SECRET. Check the environment or $TIMDO_CONFIG (API: $TIMDO_API)."
   fi
@@ -223,13 +230,21 @@ api_error() {
 api() {
   local method="$1" path="$2"
   shift 2
-  require_secret
-  local headers=(-H "X-Internal-Secret: $TIMDO_SECRET" -H "Content-Type: application/json")
+  require_credentials
+  # Credentials go to curl as a config on stdin (-K -), never as arguments, so they don't
+  # show up in `ps` for other users on the machine.
+  local auth_header
+  if [[ -n "$TIMDO_TOKEN" ]]; then
+    auth_header="Authorization: Bearer $TIMDO_TOKEN"
+  else
+    auth_header="X-Internal-Secret: $TIMDO_SECRET"
+  fi
+  local headers=(-H "Content-Type: application/json")
   [[ -n "$TIMDO_AS" ]] && headers+=(-H "X-Timdo-User: $TIMDO_AS")
   local out err code
   out=$(mktemp "$TMPD/resp.XXXXXX")
   err="$out.err"
-  if ! code=$(curl -sS -o "$out" -w '%{http_code}' -X "$method" "${headers[@]}" "$@" "${TIMDO_API}${path}" 2>"$err"); then
+  if ! code=$(curl -sS -K - -o "$out" -w '%{http_code}' -X "$method" "${headers[@]}" "$@" "${TIMDO_API}${path}" 2>"$err" <<<"header = \"$auth_header\""); then
     die "Error: could not reach the TimDo API at $TIMDO_API ($(head -c 200 "$err" | tr '\n' ' '))"
   fi
   if [[ "$code" -ge 400 ]]; then
@@ -1682,13 +1697,87 @@ cmd_whoami() {
     return
   fi
   echo "$me" | jqt '(.name // .email | paint("bold")) + " <\(.email)>" + ("  id " + .id | paint("dim"))'
-  if [[ -n "$TIMDO_AS" ]]; then
+  if [[ -n "$TIMDO_TOKEN" ]]; then
+    echo "  Signed in with a personal token (${TIMDO_TOKEN:0:10}...)."
+  elif [[ -n "$TIMDO_AS" ]]; then
     echo "  Acting as $TIMDO_AS (X-Timdo-User), via the internal secret."
+  else
+    echo "  Signed in with the owner secret."
   fi
   echo "  API: $TIMDO_API"
   local orgs
   orgs=$( (api GET /organisations 2>/dev/null) || echo '[]')
   echo "$orgs" | jqt 'if length > 0 then "  Workspaces: " + ([.[] | "\(.name) (\(.role)\(if .isPersonal then ", personal" elif (.memberCount // 1) > 1 then ", \(.memberCount) members" else "" end))"] | join("; ")) else empty end'
+}
+
+# ---------------------------------------------------------------------------
+# login / logout (personal access tokens)
+# ---------------------------------------------------------------------------
+config_set_token() {
+  local token="$1" dir tmp
+  dir=$(dirname "$TIMDO_CONFIG")
+  mkdir -p "$dir"
+  tmp=$(mktemp "$dir/.config.XXXXXX")
+  chmod 600 "$tmp"
+  if [[ -f "$TIMDO_CONFIG" ]]; then
+    grep -v '^TIMDO_TOKEN=' "$TIMDO_CONFIG" > "$tmp" || true
+  fi
+  if [[ -n "$token" ]]; then
+    printf 'TIMDO_TOKEN=%q\n' "$token" >> "$tmp"
+  fi
+  mv "$tmp" "$TIMDO_CONFIG"
+}
+
+usage_login() {
+  cat <<USAGE
+Usage: timdo login              paste the token when asked (it isn't shown on screen)
+       timdo login --token-stdin  read it from stdin, for scripts: pass-tool | timdo login --token-stdin
+
+Saves a personal access token so the CLI (and the TimDo MCP server) act as you.
+Create one in the web app: $APP_URL/settings/access
+The token is stored in $TIMDO_CONFIG, readable only by you. Avoid putting a token on a
+command line: it ends up in your shell history.
+USAGE
+}
+
+cmd_login() {
+  local token=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --token-stdin) IFS= read -r token || true; shift ;;
+      --token) token="${2:-}"; shift 2
+        echo "Note: --token leaves the token in your shell history. Next time run 'timdo login' and paste it." >&2 ;;
+      --token=*) token="${1#--token=}"; shift ;;
+      -h|--help) usage_login; return ;;
+      *) usage_die "Unknown option for login: $1" ;;
+    esac
+  done
+  if [[ -z "$token" ]]; then
+    echo "Create a token at $APP_URL/settings/access, then paste it here."
+    read -r -s -p "Token: " token
+    echo
+  fi
+  token="$(printf '%s' "$token" | tr -d '[:space:]')"
+  [[ "$token" =~ ^tdo_[A-Za-z0-9_-]{30,80}$ ]] || die "That doesn't look like a TimDo token (they start with tdo_)."
+
+  # Check it works before saving it
+  local me
+  TIMDO_TOKEN="$token"
+  TIMDO_AS=""
+  me=$(api GET /users/me)
+  config_set_token "$token"
+  echo "$me" | jqt '"Logged in as " + (.name // .email) + " <" + .email + ">."'
+  echo "Saved to $TIMDO_CONFIG. Try: timdo list do --mine"
+}
+
+cmd_logout() {
+  if [[ -f "$TIMDO_CONFIG" ]] && grep -q '^TIMDO_TOKEN=' "$TIMDO_CONFIG"; then
+    config_set_token ""
+    echo "Logged out: removed the token from $TIMDO_CONFIG."
+    echo "To stop it working everywhere, revoke it at $APP_URL/settings/access."
+  else
+    echo "No saved token in $TIMDO_CONFIG."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -2017,14 +2106,21 @@ GLOBAL FLAGS (anywhere on the line):
   --json                       JSON output (raw API objects, plus extra fields noted below)
   --text                       Human-readable output. Write commands print JSON when piped
                                unless --text is given, so existing scripts keep working.
-  --as <email>                 Act as another TimDo account (sends X-Timdo-User with the
-                               internal secret). Also: TIMDO_AS=<email>. Good for previewing
-                               what a collaborator sees, e.g. --as robin@example.com
+  --as <email>                 Owner secret only: act as another TimDo account (sends
+                               X-Timdo-User). Also: TIMDO_AS=<email>. Good for previewing
+                               what a collaborator sees, e.g. --as robin@example.com.
+                               A personal token always acts as its owner.
   --no-color                   No colour (colour is only used on a terminal; NO_COLOR is respected)
 
+SIGNING IN:
+  login                        Save a personal token (create one at /settings/access in the web app)
+  logout                       Remove the saved token
+  whoami                       Who the CLI is acting as, and your workspaces
+
 ENVIRONMENT:
-  TIMDO_SECRET, TIMDO_API, TIMDO_AS, TIMDO_CONFIG (default ~/.config/timdo/config).
-  Environment variables override the config file.
+  TIMDO_TOKEN (personal token), TIMDO_API, TIMDO_CONFIG (default ~/.config/timdo/config).
+  Owner only: TIMDO_SECRET, TIMDO_AS. Environment variables override the config file.
+  If both a token and the secret are set, the token wins.
 
 TASKS:
   list [status] [opts]         List tasks (all, do, delay, done, delegate, awaiting)
@@ -2095,6 +2191,8 @@ case "${1:-help}" in
   unlink)              shift; cmd_unlink "$@" ;;
   activity|history)    shift; cmd_activity "$@" ;;
   whoami|me)           shift; cmd_whoami "$@" ;;
+  login)               shift; cmd_login "$@" ;;
+  logout)              shift; cmd_logout "$@" ;;
   help|-h|--help)      cmd_help ;;
   *) usage_die "Unknown command: $1. Run 'timdo help' for usage." ;;
 esac

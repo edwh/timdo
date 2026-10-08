@@ -29,6 +29,10 @@ declare module 'hono' {
   interface ContextVariableMap {
     db: DrizzleD1Database<typeof schema>;
     userId: string;
+    /** How the caller signed in: web session, personal token, or the owner's internal secret */
+    authMethod: 'jwt' | 'token' | 'internal';
+    /** Set when signed in with a personal token */
+    tokenId?: string;
   }
 }
 

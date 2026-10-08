@@ -9,3 +9,7 @@ export const userCreateSchema = z.object({
 });
 
 export type UserCreatePayload = z.infer<typeof userCreateSchema>;
+
+export const tokenCreateSchema = z.object({
+  name: z.string().trim().min(1, 'Give the token a name, e.g. "Laptop CLI"').max(60),
+});

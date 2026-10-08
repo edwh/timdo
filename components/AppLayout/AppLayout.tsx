@@ -13,6 +13,7 @@ import {
   IconPlus,
   IconPrinter,
   IconTarget,
+  IconTerminal2,
   IconUsers,
 } from '@tabler/icons-react';
 import { signOut, useSession } from 'next-auth/react';
@@ -196,6 +197,13 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
               label="Poster Studio"
               active={pathname === '/poster'}
               leftSection={<IconPrinter size="1rem" stroke={1.5} />}
+            />
+            <NavLink
+              component={Link}
+              href="/settings/access"
+              label="CLI & MCP"
+              active={pathname?.startsWith('/settings/access')}
+              leftSection={<IconTerminal2 size="1rem" stroke={1.5} />}
             />
             <NavLink
               label="Logout"

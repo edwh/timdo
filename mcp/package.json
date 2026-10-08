@@ -1,0 +1,19 @@
+{
+  "name": "timdo-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for TimDo: tasks, epics, goals, workspaces and sharing, via bin/timdo",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.5.0"
+  }
+}
