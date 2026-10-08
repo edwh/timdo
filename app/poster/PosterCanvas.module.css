@@ -1,0 +1,112 @@
+.viewport {
+  width: 100%;
+  min-height: 70vh;
+  max-height: 80vh;
+  overflow: auto;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  background-color: var(--mantine-color-gray-1);
+  border: 1px solid var(--mantine-color-gray-3);
+  border-radius: var(--mantine-radius-md);
+  padding: var(--mantine-spacing-md);
+  box-sizing: border-box;
+}
+
+.canvasContainer {
+  display: inline-block;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+  background-color: #fff;
+  border-radius: 4px;
+  line-height: 0;
+  transition: max-width 0.2s ease;
+}
+
+.fitScreen {
+  max-width: min(100%, 75vh * (420 / 594));
+  height: auto;
+}
+
+.fitScreen svg {
+  width: 100% !important;
+  height: auto !important;
+  max-width: 100%;
+  display: block;
+}
+
+.actualScale {
+  max-width: none;
+  overflow: visible;
+}
+
+.actualScale svg {
+  display: block;
+}
+
+/* Multi-sheet tiled grid for print or raw view */
+.tiledContainer {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.tileSheet {
+  background-color: #fff;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+  margin-bottom: 20px;
+  page-break-after: always;
+  break-after: page;
+}
+
+/* High-contrast Monochrome Laser Print Styles */
+@media print {
+  .noPrint {
+    display: none !important;
+  }
+
+  .viewport {
+    border: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    max-height: none !important;
+    min-height: auto !important;
+    overflow: visible !important;
+    background: transparent !important;
+  }
+
+  .canvasContainer {
+    box-shadow: none !important;
+    border-radius: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+  }
+
+  .canvasContainer svg {
+    width: 100% !important;
+    height: auto !important;
+    max-height: 100vh !important;
+    display: block !important;
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  .tileSheet {
+    box-shadow: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    page-break-after: always !important;
+    break-after: page !important;
+    width: 100% !important;
+    height: 100vh !important;
+  }
+
+  .tileSheet svg {
+    width: 100% !important;
+    height: 100% !important;
+  }
+}
+
+@page {
+  size: A4 portrait;
+  margin: 0;
+}

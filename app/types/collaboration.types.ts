@@ -1,0 +1,159 @@
+/**
+ * @fileoverview Types for sharing (workspaces, people, invites, projects) and the activity log.
+ * Mirrors the API contract in docs/collaboration.md.
+ * @module app/types/collaboration.types
+ */
+
+export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
+
+/** Roles that can be given through an invite (owners are promoted afterwards). */
+export type InviteRole = Exclude<WorkspaceRole, 'owner'>;
+
+export interface Me {
+  id: string;
+  email: string;
+  name: string | null;
+}
+
+export interface SharingMember {
+  id?: string;
+  orgId?: string;
+  userId: string;
+  userName: string | null;
+  userEmail: string;
+  role: WorkspaceRole;
+  isMe: boolean;
+  createdAt?: string | null;
+}
+
+export interface SharingProject {
+  id: string;
+  key: string;
+  name: string;
+  description: string | null;
+  isArchived: boolean;
+  openTasks: number;
+  doneTasks: number;
+  epicCount: number;
+}
+
+export interface SharingInvite {
+  id: string;
+  email: string;
+  role: InviteRole;
+  token: string;
+  expiresAt: string;
+}
+
+export interface SharingWorkspace {
+  id: string;
+  name: string;
+  slug: string;
+  isPersonal: boolean;
+  role: WorkspaceRole;
+  memberCount: number;
+  projectCount: number;
+  createdBy: string;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  members: SharingMember[];
+  projects: SharingProject[];
+  invites: SharingInvite[];
+}
+
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  slug: string;
+  isPersonal: boolean;
+  role: WorkspaceRole;
+  memberCount: number;
+  projectCount: number;
+  createdBy: string;
+}
+
+export interface UserSearchResult {
+  id: string;
+  name: string | null;
+  email: string;
+  isMember: boolean;
+  role?: WorkspaceRole;
+}
+
+export type InviteResult =
+  | { status: 'added'; userId: string; name: string | null; email: string; role: WorkspaceRole }
+  | { status: 'already_member'; userId: string; email: string; role: WorkspaceRole }
+  | {
+      status: 'invited';
+      id: string;
+      email: string;
+      role: WorkspaceRole;
+      token: string;
+      expiresAt: string;
+    };
+
+export interface AcceptInviteResult {
+  success: boolean;
+  orgId: string;
+  role: WorkspaceRole;
+}
+
+export interface ProjectContainerUpdate {
+  name?: string;
+  description?: string | null;
+  isArchived?: boolean;
+  /** Move the project to this workspace */
+  orgId?: string;
+}
+
+/* ------------------------------------------------------------------ activity */
+
+export type ActivityAction =
+  | 'created'
+  | 'updated'
+  | 'status_changed'
+  | 'completed'
+  | 'assigned'
+  | 'moved'
+  | 'deleted'
+  | 'restored'
+  | 'merged'
+  | 'note_added'
+  | 'note_deleted'
+  | 'renamed'
+  | 'archived'
+  | 'unarchived'
+  | 'invited'
+  | 'member_added'
+  | 'member_joined'
+  | 'member_left'
+  | 'member_removed'
+  | 'role_changed';
+
+export type ActivityEntityType = 'task' | 'epic' | 'note' | 'project' | 'organisation' | 'member';
+
+export interface ActivityEntry {
+  id: string;
+  actorId: string | null;
+  actorName: string;
+  orgId: string | null;
+  projectId: string | null;
+  projectName: string | null;
+  entityType: ActivityEntityType;
+  entityId: string;
+  taskId: string | null;
+  epicId: string | null;
+  /** One of ActivityAction, kept open so new server actions still render */
+  action: ActivityAction | (string & {});
+  summary: string;
+  changes: Record<string, { from: unknown; to: unknown }> | null;
+  createdAt: string | null;
+}
+
+export interface ActivityFilters {
+  taskId?: string;
+  epicId?: string;
+  projectId?: string;
+  orgId?: string;
+  limit?: number;
+}

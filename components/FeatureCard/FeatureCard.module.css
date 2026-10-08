@@ -1,0 +1,25 @@
+.card {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.card:hover {
+  transform: translateY(-4px);
+  box-shadow: var(--mantine-shadow-md);
+}
+
+.icon {
+  margin: 0 auto;
+}
+
+.title {
+  text-align: center;
+  font-weight: 600;
+}
+
+.description {
+  text-align: center;
+  line-height: 1.6;
+}

@@ -1,0 +1,236 @@
+/**
+ * Who can see and change what.
+ *
+ * Access flows from workspace (Organisations) membership: a member of a workspace can see
+ * every project in it. Roles:
+ *   owner  - everything, including deleting the workspace and changing roles
+ *   admin  - manage members and projects
+ *   member - read and edit tasks, epics and notes
+ *   viewer - read only
+ */
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import type { DrizzleD1Database } from 'drizzle-orm/d1';
+import { v4 as uuidv4 } from 'uuid';
+import * as schema from '../db/schema';
+import { generateProjectKey, generateSlug } from './migrationService';
+
+type DB = DrizzleD1Database<typeof schema>;
+
+export type Role = 'owner' | 'admin' | 'member' | 'viewer';
+
+export interface AccessibleProject {
+  id: string;
+  key: string;
+  name: string;
+  orgId: string;
+  orgName: string;
+  orgIsPersonal: boolean;
+  role: Role;
+  memberCount: number;
+  isArchived: boolean;
+}
+
+export class AccessError extends Error {
+  status: 403 | 404;
+  constructor(message: string, status: 403 | 404 = 403) {
+    super(message);
+    this.status = status;
+  }
+}
+
+export const canEdit = (role: Role | null | undefined) =>
+  role === 'owner' || role === 'admin' || role === 'member';
+export const canManage = (role: Role | null | undefined) => role === 'owner' || role === 'admin';
+
+export async function getAccessibleProjects(db: DB, userId: string): Promise<AccessibleProject[]> {
+  const rows = await db
+    .select({
+      id: schema.projects.id,
+      key: schema.projects.key,
+      name: schema.projects.name,
+      orgId: schema.projects.orgId,
+      orgName: schema.organisations.name,
+      orgIsPersonal: schema.organisations.isPersonal,
+      role: schema.organisationMembers.role,
+      isArchived: schema.projects.isArchived,
+      memberCount: sql<number>`(select count(*) from OrganisationMembers om where om.org_id = Projects.org_id)`,
+    })
+    .from(schema.projects)
+    .innerJoin(schema.organisations, eq(schema.organisations.id, schema.projects.orgId))
+    .innerJoin(
+      schema.organisationMembers,
+      and(
+        eq(schema.organisationMembers.orgId, schema.projects.orgId),
+        eq(schema.organisationMembers.userId, userId)
+      )
+    )
+    .orderBy(asc(schema.projects.name));
+
+  return rows.map((r) => ({
+    ...r,
+    orgIsPersonal: !!r.orgIsPersonal,
+    isArchived: !!r.isArchived,
+    memberCount: Number(r.memberCount || 0),
+    role: r.role as Role,
+  }));
+}
+
+export async function getProjectAccess(
+  db: DB,
+  userId: string,
+  projectId: string
+): Promise<AccessibleProject | null> {
+  const all = await getAccessibleProjects(db, userId);
+  return all.find((p) => p.id === projectId) ?? null;
+}
+
+export async function getOrgRole(db: DB, userId: string, orgId: string): Promise<Role | null> {
+  const row = await db
+    .select({ role: schema.organisationMembers.role })
+    .from(schema.organisationMembers)
+    .where(
+      and(
+        eq(schema.organisationMembers.orgId, orgId),
+        eq(schema.organisationMembers.userId, userId)
+      )
+    )
+    .get();
+  return (row?.role as Role) ?? null;
+}
+
+/**
+ * Every user gets one personal workspace. Returns its id, creating it on first use.
+ */
+export async function ensurePersonalOrg(db: DB, userId: string): Promise<string> {
+  const existing = await db
+    .select({ id: schema.organisations.id })
+    .from(schema.organisations)
+    .innerJoin(
+      schema.organisationMembers,
+      eq(schema.organisationMembers.orgId, schema.organisations.id)
+    )
+    .where(
+      and(
+        eq(schema.organisations.isPersonal, true),
+        eq(schema.organisations.createdBy, userId),
+        eq(schema.organisationMembers.userId, userId)
+      )
+    )
+    .get();
+  if (existing) {
+    return existing.id;
+  }
+
+  const user = await db
+    .select({ name: schema.users.name, email: schema.users.email })
+    .from(schema.users)
+    .where(eq(schema.users.id, userId))
+    .get();
+
+  const orgId = uuidv4();
+  const name = user?.name || user?.email?.split('@')[0] || 'Personal';
+  const now = new Date().toISOString();
+  await db.insert(schema.organisations).values({
+    id: orgId,
+    name,
+    slug: `${generateSlug(name)}-${orgId.slice(0, 6)}`,
+    isPersonal: true,
+    createdBy: userId,
+    createdAt: now,
+    updatedAt: now,
+  });
+  await db.insert(schema.organisationMembers).values({
+    id: uuidv4(),
+    orgId,
+    userId,
+    role: 'owner',
+    createdAt: now,
+    updatedAt: now,
+  });
+  return orgId;
+}
+
+export async function createProjectInOrg(
+  db: DB,
+  userId: string,
+  orgId: string,
+  name: string,
+  description?: string | null
+) {
+  const role = await getOrgRole(db, userId, orgId);
+  if (!canEdit(role)) {
+    throw new AccessError('You cannot add projects to this workspace');
+  }
+  const now = new Date().toISOString();
+  const project = {
+    id: uuidv4(),
+    orgId,
+    key: generateProjectKey(name),
+    name: name.trim(),
+    description: description ?? null,
+    leadUserId: userId,
+    isArchived: false,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await db.insert(schema.projects).values(project);
+  return project;
+}
+
+/**
+ * Turn a category name ("Solfit") into a project the user can write to.
+ * Prefers an exact match the user can edit; if none exists and createIfMissing is set,
+ * creates the project in the user's personal workspace.
+ */
+export async function resolveProjectForWrite(
+  db: DB,
+  userId: string,
+  categoryName: string | null | undefined,
+  createIfMissing = true
+): Promise<AccessibleProject> {
+  const name = (categoryName || '').trim() || 'General';
+  const all = await getAccessibleProjects(db, userId);
+  // On a name clash prefer your personal workspace, then ones you own, so nobody can
+  // redirect your tasks by adding you to a workspace with a same-named project.
+  const rank = (p: AccessibleProject) => (p.orgIsPersonal ? 0 : p.role === 'owner' ? 1 : 2);
+  const matches = all
+    .filter((p) => p.name.toLowerCase() === name.toLowerCase())
+    .sort((a, b) => rank(a) - rank(b));
+  const editable = matches.find((p) => canEdit(p.role));
+  if (editable) {
+    return editable;
+  }
+  if (matches.length > 0) {
+    throw new AccessError(`You have view-only access to "${matches[0].name}"`);
+  }
+  if (!createIfMissing) {
+    throw new AccessError(`No project called "${name}"`, 404);
+  }
+  const orgId = await ensurePersonalOrg(db, userId);
+  await createProjectInOrg(db, userId, orgId, name);
+  const created = (await getAccessibleProjects(db, userId)).find(
+    (p) => p.orgId === orgId && p.name.toLowerCase() === name.toLowerCase()
+  );
+  if (!created) {
+    throw new Error('Failed to create project');
+  }
+  return created;
+}
+
+/** Map of user id -> display name, for attribution. */
+export async function getUserNames(db: DB, ids: Array<string | null | undefined>) {
+  const unique = Array.from(new Set(ids.filter((id): id is string => !!id)));
+  const map = new Map<string, string>();
+  // D1 caps bound parameters at 100 per query
+  for (let i = 0; i < unique.length; i += 90) {
+    const chunk = unique.slice(i, i + 90);
+    const rows = await db
+      .select({ id: schema.users.id, name: schema.users.name, email: schema.users.email })
+      .from(schema.users)
+      .where(inArray(schema.users.id, chunk));
+    for (const r of rows) {
+      map.set(r.id, r.name || r.email);
+    }
+  }
+  return map;
+}

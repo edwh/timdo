@@ -1,0 +1,418 @@
+/**
+ * Epics belong to a project (category). Anyone in the project's workspace can see them;
+ * members and above can change them. An epic with no project is private to its creator.
+ * The life goal on an epic is personal to whoever created it, so it's hidden from others.
+ */
+import { and, asc, eq, inArray, isNull, or } from 'drizzle-orm';
+import type { DrizzleD1Database } from 'drizzle-orm/d1';
+import { v4 as uuidv4 } from 'uuid';
+import * as schema from '../db/schema';
+import type {
+  EpicCreateInput,
+  EpicCreatePayload,
+  EpicUpdatePayload,
+} from '../validators/epicValidators';
+import {
+  AccessError,
+  canEdit,
+  canManage,
+  getAccessibleProjects,
+  getUserNames,
+  resolveProjectForWrite,
+  type AccessibleProject,
+  type Role,
+} from './accessService';
+import { describeFieldEdits, diffFields, logActivity, statusLabel } from './activityService';
+
+type DB = DrizzleD1Database<typeof schema>;
+type EpicRow = typeof schema.epics.$inferSelect;
+
+export interface EpicWithStats {
+  id: string;
+  userId: string;
+  title: string;
+  description: string | null;
+  category: string | null;
+  goalId: string | null;
+  status: 'active' | 'completed' | 'on_hold';
+  createdAt: string | null;
+  updatedAt: string | null;
+  totalTasks: number;
+  doneTasks: number;
+  progressPercentage: number;
+  projectId: string | null;
+  projectKey: string | null;
+  orgId: string | null;
+  orgName: string | null;
+  isShared: boolean;
+  myRole: Role | null;
+  canEdit: boolean;
+  createdById: string;
+  createdByName: string | null;
+  updatedById: string | null;
+  updatedByName: string | null;
+}
+
+function toView(
+  epic: EpicRow,
+  project: AccessibleProject | undefined,
+  userId: string,
+  names: Map<string, string>,
+  stats: { totalTasks: number; doneTasks: number }
+): EpicWithStats {
+  const isCreator = epic.userId === userId;
+  const role: Role | null = project ? project.role : isCreator ? 'owner' : null;
+  return {
+    id: epic.id,
+    userId: epic.userId,
+    title: epic.title,
+    description: epic.description,
+    category: project?.name ?? epic.category ?? null,
+    goalId: isCreator ? epic.goalId : null,
+    status: epic.status,
+    createdAt: epic.createdAt,
+    updatedAt: epic.updatedAt,
+    totalTasks: stats.totalTasks,
+    doneTasks: stats.doneTasks,
+    progressPercentage:
+      stats.totalTasks > 0 ? Math.round((stats.doneTasks / stats.totalTasks) * 100) : 0,
+    projectId: project?.id ?? null,
+    projectKey: project?.key ?? null,
+    orgId: project?.orgId ?? null,
+    orgName: project?.orgName ?? null,
+    isShared: (project?.memberCount ?? 1) > 1,
+    myRole: role,
+    canEdit: canEdit(role),
+    createdById: epic.userId,
+    createdByName: names.get(epic.userId) ?? null,
+    updatedById: epic.updatedBy ?? epic.userId,
+    updatedByName: names.get(epic.updatedBy ?? epic.userId) ?? null,
+  };
+}
+
+async function visibleEpics(db: DB, userId: string, projects: AccessibleProject[]) {
+  const projectIds = projects.map((p) => p.id);
+  return db
+    .select()
+    .from(schema.epics)
+    .where(
+      or(
+        projectIds.length ? inArray(schema.epics.projectId, projectIds) : undefined,
+        and(isNull(schema.epics.projectId), eq(schema.epics.userId, userId))
+      )
+    )
+    .orderBy(asc(schema.epics.createdAt));
+}
+
+/** Progress counts only tasks the viewer can see, so the numbers match the list. */
+async function statsFor(db: DB, epicIds: string[], visibleProjectIds: string[]) {
+  const stats = new Map<string, { totalTasks: number; doneTasks: number }>();
+  if (epicIds.length === 0 || visibleProjectIds.length === 0) {
+    return stats;
+  }
+  const rows = await db
+    .select({ epicId: schema.tasks.epicId, status: schema.tasks.status })
+    .from(schema.tasks)
+    .where(
+      and(
+        eq(schema.tasks.isDeleted, false),
+        inArray(schema.tasks.epicId, epicIds),
+        inArray(schema.tasks.projectId, visibleProjectIds)
+      )
+    );
+  for (const r of rows) {
+    if (!r.epicId) {
+      continue;
+    }
+    const s = stats.get(r.epicId) || { totalTasks: 0, doneTasks: 0 };
+    s.totalTasks += 1;
+    if (r.status === 'done') {
+      s.doneTasks += 1;
+    }
+    stats.set(r.epicId, s);
+  }
+  return stats;
+}
+
+export async function getEpicsForUser(
+  db: DB,
+  userId: string,
+  category?: string
+): Promise<EpicWithStats[]> {
+  const projects = await getAccessibleProjects(db, userId);
+  const byId = new Map(projects.map((p) => [p.id, p]));
+  let epics = await visibleEpics(db, userId, projects);
+  if (category) {
+    const c = category.trim().toLowerCase();
+    epics = epics.filter((e) => {
+      const name = e.projectId ? byId.get(e.projectId)?.name : e.category;
+      return (name ?? '').toLowerCase() === c;
+    });
+  }
+
+  const stats = new Map<string, { totalTasks: number; doneTasks: number }>();
+  // D1 caps bound parameters at 100 per query
+  for (let i = 0; i < epics.length; i += 90) {
+    const chunk = await statsFor(
+      db,
+      epics.slice(i, i + 90).map((e) => e.id),
+      projects.map((p) => p.id)
+    );
+    chunk.forEach((v, k) => stats.set(k, v));
+  }
+  const names = await getUserNames(
+    db,
+    epics.flatMap((e) => [e.userId, e.updatedBy])
+  );
+
+  return epics.map((e) =>
+    toView(
+      e,
+      e.projectId ? byId.get(e.projectId) : undefined,
+      userId,
+      names,
+      stats.get(e.id) || { totalTasks: 0, doneTasks: 0 }
+    )
+  );
+}
+
+export async function getEpicForUser(
+  db: DB,
+  userId: string,
+  epicId: string
+): Promise<EpicWithStats | null> {
+  const epic = await db.select().from(schema.epics).where(eq(schema.epics.id, epicId)).get();
+  if (!epic) {
+    return null;
+  }
+  const projects = await getAccessibleProjects(db, userId);
+  const project = epic.projectId ? projects.find((p) => p.id === epic.projectId) : undefined;
+  if (epic.projectId ? !project : epic.userId !== userId) {
+    return null;
+  }
+  const [stats, names] = await Promise.all([
+    statsFor(
+      db,
+      [epic.id],
+      projects.map((p) => p.id)
+    ),
+    getUserNames(db, [epic.userId, epic.updatedBy]),
+  ]);
+  return toView(
+    epic,
+    project,
+    userId,
+    names,
+    stats.get(epic.id) || { totalTasks: 0, doneTasks: 0 }
+  );
+}
+
+export async function createEpic(
+  db: DB,
+  userId: string,
+  data: (EpicCreateInput | EpicCreatePayload) & { id?: string; projectId?: string }
+) {
+  let project: AccessibleProject | undefined;
+  if (data.projectId) {
+    project = (await getAccessibleProjects(db, userId)).find((p) => p.id === data.projectId);
+    if (!project) {
+      throw new AccessError('Project not found', 404);
+    }
+    if (!canEdit(project.role)) {
+      throw new AccessError(`You have view-only access to "${project.name}"`);
+    }
+  } else if (data.category) {
+    project = await resolveProjectForWrite(db, userId, data.category);
+  }
+
+  const now = new Date().toISOString();
+  const row = {
+    id: data.id ?? uuidv4(),
+    userId,
+    title: data.title,
+    description: data.description ?? null,
+    category: project?.name ?? data.category ?? null,
+    projectId: project?.id ?? null,
+    goalId: data.goalId ?? null,
+    status: data.status ?? 'active',
+    updatedBy: userId,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await db.insert(schema.epics).values(row);
+  await logActivity(db, {
+    actorId: userId,
+    orgId: project?.orgId ?? null,
+    projectId: project?.id ?? null,
+    entityType: 'epic',
+    entityId: row.id,
+    epicId: row.id,
+    action: 'created',
+    summary: `Created epic "${row.title}"`,
+  });
+  return getEpicForUser(db, userId, row.id);
+}
+
+async function loadEditableEpic(db: DB, userId: string, epicId: string) {
+  const epic = await db.select().from(schema.epics).where(eq(schema.epics.id, epicId)).get();
+  if (!epic) {
+    return null;
+  }
+  const projects = await getAccessibleProjects(db, userId);
+  const project = epic.projectId ? projects.find((p) => p.id === epic.projectId) : undefined;
+  if (epic.projectId ? !project : epic.userId !== userId) {
+    return null;
+  }
+  if (project && !canEdit(project.role)) {
+    throw new AccessError(`You have view-only access to "${project.name}"`);
+  }
+  return { epic, project };
+}
+
+export async function updateEpic(
+  db: DB,
+  userId: string,
+  epicId: string,
+  data: EpicUpdatePayload & { projectId?: string }
+) {
+  const loaded = await loadEditableEpic(db, userId, epicId);
+  if (!loaded) {
+    return null;
+  }
+  const { epic } = loaded;
+  let { project } = loaded;
+
+  const patch: Partial<typeof schema.epics.$inferInsert> = {};
+  if (data.title !== undefined) {
+    patch.title = data.title;
+  }
+  if (data.description !== undefined) {
+    patch.description = data.description;
+  }
+  if (data.status !== undefined) {
+    patch.status = data.status;
+  }
+  // The goal is personal to the creator; collaborators can't change it
+  if (data.goalId !== undefined && epic.userId === userId) {
+    patch.goalId = data.goalId;
+  }
+
+  if (data.projectId && data.projectId !== epic.projectId) {
+    const target = (await getAccessibleProjects(db, userId)).find((p) => p.id === data.projectId);
+    if (!target) {
+      throw new AccessError('Project not found', 404);
+    }
+    if (!canEdit(target.role)) {
+      throw new AccessError(`You have view-only access to "${target.name}"`);
+    }
+    project = target;
+  } else if (
+    data.category !== undefined &&
+    (data.category ?? '').trim().toLowerCase() !==
+      (project?.name ?? epic.category ?? '').toLowerCase()
+  ) {
+    project = data.category ? await resolveProjectForWrite(db, userId, data.category) : undefined;
+  }
+  if ((project?.id ?? null) !== epic.projectId) {
+    const from = loaded.project;
+    if (from && project?.orgId !== from.orgId) {
+      // Its tasks would be left behind in the old workspace; moving the project moves both
+      if (!canManage(from.role)) {
+        throw new AccessError(`Only owners and admins can move epics out of ${from.orgName}`);
+      }
+      const stranded = await db
+        .select({ id: schema.tasks.id })
+        .from(schema.tasks)
+        .where(and(eq(schema.tasks.epicId, epic.id), eq(schema.tasks.isDeleted, false)))
+        .limit(1)
+        .get();
+      if (stranded) {
+        throw new AccessError(
+          'This epic has tasks. Move the whole project from the Sharing page instead.'
+        );
+      }
+    }
+    patch.projectId = project?.id ?? null;
+    patch.category = project?.name ?? null;
+  }
+
+  const changes = diffFields(epic as any, patch as any, [
+    'title',
+    'description',
+    'status',
+    'goalId',
+    'projectId',
+  ]);
+  if (Object.keys(changes).length === 0) {
+    return getEpicForUser(db, userId, epicId);
+  }
+
+  await db
+    .update(schema.epics)
+    .set({ ...patch, updatedAt: new Date().toISOString(), updatedBy: userId })
+    .where(eq(schema.epics.id, epicId));
+
+  const title = (patch.title as string) ?? epic.title;
+  const base = {
+    actorId: userId,
+    orgId: project?.orgId ?? null,
+    projectId: project?.id ?? null,
+    entityType: 'epic' as const,
+    entityId: epicId,
+    epicId,
+  };
+  if (changes.status) {
+    await logActivity(db, {
+      ...base,
+      action: changes.status.to === 'completed' ? 'completed' : 'status_changed',
+      summary: `Marked epic "${title}" as ${statusLabel(changes.status.to)}`,
+      changes: { status: changes.status },
+    });
+  }
+  if (changes.projectId) {
+    await logActivity(db, {
+      ...base,
+      action: 'moved',
+      summary: `Moved epic "${title}" to ${project?.name ?? 'no project'}`,
+      changes: { projectId: changes.projectId },
+    });
+  }
+  const { status: _s, projectId: _p, goalId: _g, ...rest } = changes;
+  const summary = describeFieldEdits(rest);
+  if (summary) {
+    await logActivity(db, {
+      ...base,
+      action: 'updated',
+      summary: `${summary} on epic "${title}"`,
+      changes: rest,
+    });
+  }
+  return getEpicForUser(db, userId, epicId);
+}
+
+export async function deleteEpic(db: DB, userId: string, epicId: string) {
+  let loaded;
+  try {
+    loaded = await loadEditableEpic(db, userId, epicId);
+  } catch (err) {
+    if (err instanceof AccessError) {
+      return false;
+    }
+    throw err;
+  }
+  if (!loaded) {
+    return false;
+  }
+  await db.delete(schema.epics).where(eq(schema.epics.id, epicId));
+  await logActivity(db, {
+    actorId: userId,
+    orgId: loaded.project?.orgId ?? null,
+    projectId: loaded.project?.id ?? null,
+    entityType: 'epic',
+    entityId: epicId,
+    epicId,
+    action: 'deleted',
+    summary: `Deleted epic "${loaded.epic.title}"`,
+  });
+  return true;
+}

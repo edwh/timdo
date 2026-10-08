@@ -1,0 +1,10 @@
+.container {
+  padding-top: var(--mantine-spacing-xl);
+  padding-bottom: var(--mantine-spacing-xl);
+  max-width: 600px;
+}
+
+.emptyProject {
+  border-style: dashed;
+  background-color: light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-8));
+}

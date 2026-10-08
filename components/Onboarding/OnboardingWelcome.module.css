@@ -1,0 +1,36 @@
+.container {
+  padding-top: var(--mantine-spacing-xl);
+  padding-bottom: var(--mantine-spacing-xl);
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+}
+
+.title {
+  font-size: clamp(1.75rem, 4vw, 2.5rem);
+}
+
+.scriptBox {
+  width: 100%;
+  max-width: 500px;
+}
+
+.codeBlock {
+  white-space: pre-wrap;
+  font-family: monospace;
+  font-size: 0.875rem;
+}
+
+.recordingButton {
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.7;
+  }
+}

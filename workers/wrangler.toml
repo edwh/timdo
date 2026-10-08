@@ -1,0 +1,43 @@
+name = "timdo-v2-api" # Your worker's name
+main = "src/index.ts" # Entry point for the worker
+compatibility_date = "2024-07-25"
+
+# Dev server configuration
+[dev]
+ip = "127.0.0.1"
+port = 8787 # Port for wrangler dev
+local_protocol = "http"
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"                  # How it's accessed in worker code (c.env.DB)
+database_name = "timdo-v2-db"   # Name of your D1 database in Cloudflare
+database_id = "53ef6286-8675-4fe3-862f-636048e0a972"   # The ID of your D1 database (get this after creating the DB)
+# For local development with a local D1 DB:
+# preview_database_id = "your-preview-d1-db-id" # Optional: for `wrangler dev --remote` if you want a separate preview DB
+
+# Migrations for D1
+# This path is relative to the wrangler.toml file (i.e., inside the 'workers' directory).
+migrations_dir = "./migrations"
+
+# Cron trigger: check for past-due awaiting items once per hour
+[triggers]
+crons = ["0 * * * *"]
+
+# Environment variables (for local development)
+# For production, these should be set as secrets using `wrangler secret put VAR_NAME`
+[vars]
+AUTH0_DOMAIN = "relatemate.uk.auth0.com" # Auth0 domain WITHOUT https:// prefix
+AUTH0_AUDIENCE = "https://api.timdo.tdobson.net"   # Replace with your Auth0 API Audience
+
+# Example for a preview/staging environment (optional)
+# [env.preview]
+# name = "timdo-v2-api-preview"
+# route = { pattern = "preview.api.yourdomain.com/*", custom_domain = true } # Example route
+# [env.preview.vars]
+# AUTH0_DOMAIN = "your-staging-auth0-domain.auth0.com"
+# AUTH0_AUDIENCE = "your-staging-auth0-api-audience"
+# [[env.preview.d1_databases]]
+# binding = "DB"
+# database_name = "timdo-v2-staging-db"
+# database_id = "your-staging-d1-database-id"

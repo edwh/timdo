@@ -1,0 +1,44 @@
+.toolbar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  background: light-dark(
+    var(--mantine-color-red-0),
+    var(--mantine-color-dark-7)
+  );
+  border-bottom: 2px solid light-dark(
+    var(--mantine-color-red-3),
+    var(--mantine-color-red-9)
+  );
+  padding: var(--mantine-spacing-lg);
+  box-shadow: var(--mantine-shadow-md);
+  min-height: 80px; /* Extra deep as requested */
+}
+
+.pulse {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background-color: var(--mantine-color-red-6);
+  animation: pulse 1.5s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 0.5;
+    transform: scale(1.1);
+  }
+}
+
+/* Add padding to body when toolbar is active */
+.bodyOffset {
+  padding-top: 80px;
+}

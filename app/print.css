@@ -1,0 +1,27 @@
+/* Global print styles */
+@media print {
+  header,
+  nav,
+  .mantine-AppShell-header,
+  .mantine-AppShell-navbar,
+  .mantine-AppShell-aside,
+  .mantine-Burger-root,
+  .no-print {
+    display: none !important;
+  }
+
+  body,
+  html {
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #fff !important;
+    color: #000 !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .mantine-AppShell-main {
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+}

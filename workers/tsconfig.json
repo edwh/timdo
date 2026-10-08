@@ -1,0 +1,23 @@
+{
+	"compilerOptions": {
+		"target": "ESNext",
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"lib": ["ESNext"],
+		"esModuleInterop": true,
+		"strict": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"resolveJsonModule": true,
+		"isolatedModules": true,
+		"noEmit": true,
+		"types": ["@cloudflare/workers-types", "vitest/globals"],
+		"baseUrl": ".",
+		"paths": {
+			"@/*": ["./src/*"],
+			"@app/*": ["../app/*"]
+		}
+	},
+	"include": ["src/**/*.ts", "test/**/*.ts", "*.config.ts", "migrations"],
+	"exclude": ["node_modules", "dist"]
+}

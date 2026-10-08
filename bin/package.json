@@ -1,0 +1,14 @@
+{
+  "name": "timdo-cli",
+  "version": "1.0.0",
+  "description": "CLI for TimDo task management",
+  "bin": {
+    "timdo": "./timdo"
+  },
+  "scripts": {
+    "install-cli": "mkdir -p ~/.local/bin && ln -sf $(pwd)/timdo ~/.local/bin/timdo && echo 'Installed timdo to ~/.local/bin/timdo'",
+    "uninstall-cli": "rm -f ~/.local/bin/timdo && echo 'Removed timdo from ~/.local/bin'",
+    "setup": "mkdir -p ~/.config/timdo && test -f ~/.config/timdo/config || echo 'TIMDO_SECRET=\"your-secret-here\"' > ~/.config/timdo/config && chmod 600 ~/.config/timdo/config && echo 'Config at ~/.config/timdo/config - edit to add your secret'"
+  },
+  "license": "AGPL-3.0-or-later"
+}

@@ -1,0 +1,43 @@
+.card {
+  /* The accordion item itself */
+  transition: background-color 0.2s ease;
+  touch-action: manipulation; /* Prevent scroll-drag conflicts on touch devices */
+}
+
+.editing {
+  background-color: light-dark(var(--mantine-color-blue-0), var(--mantine-color-dark-8));
+}
+
+.control {
+  /* The accordion control (the part you click to open) */
+}
+
+.panel {
+  /* The accordion panel (the content that expands) */
+}
+
+.actionButtons {
+  border-top: 1px solid light-dark(var(--mantine-color-gray-2), var(--mantine-color-dark-6));
+  padding-top: var(--mantine-spacing-sm);
+  margin-top: var(--mantine-spacing-sm);
+}
+
+.fullWidth {
+  flex-grow: 1;
+}
+
+.dragHandle {
+  cursor: grab;
+  touch-action: manipulation; /* Recommended for Touch sensor per @dnd-kit docs */
+  flex-shrink: 0;
+  min-width: 44px; /* Minimum touch target size */
+  min-height: 44px;
+}
+
+.dragHandle:active {
+  cursor: grabbing;
+}
+
+.dragHandle:hover {
+  background-color: light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6));
+}

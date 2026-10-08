@@ -1,0 +1,2100 @@
+#!/usr/bin/env bash
+# timdo: command line client for the TimDo API (tasks, epics, goals, workspaces and sharing).
+# Run `timdo help` for usage. Needs bash, curl and jq.
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration. Environment variables win over the config file, so
+#   TIMDO_API=http://127.0.0.1:8788/api/v2 TIMDO_SECRET=local-dev-secret timdo list
+# talks to a local API even when ~/.config/timdo/config holds the production secret.
+# ---------------------------------------------------------------------------
+_env_secret="${TIMDO_SECRET:-}"
+_env_api="${TIMDO_API:-}"
+_env_as="${TIMDO_AS:-}"
+TIMDO_CONFIG="${TIMDO_CONFIG:-$HOME/.config/timdo/config}"
+if [[ -f "$TIMDO_CONFIG" ]]; then
+  # shellcheck disable=SC1090
+  source "$TIMDO_CONFIG"
+fi
+[[ -n "$_env_secret" ]] && TIMDO_SECRET="$_env_secret"
+[[ -n "$_env_api" ]] && TIMDO_API="$_env_api"
+[[ -n "$_env_as" ]] && TIMDO_AS="$_env_as"
+TIMDO_API="${TIMDO_API:-https://timdo-v2-api.tdobson.net/api/v2}"
+TIMDO_AS="${TIMDO_AS:-}"
+TIMDO_FORMAT="${TIMDO_FORMAT:-text}"
+FORMAT_EXPLICIT=0
+APP_URL="${TIMDO_APP_URL:-https://timdo.tdobson.net}"
+
+# ---------------------------------------------------------------------------
+# Global flags may appear anywhere: --json, --text, --as <email>, --no-color
+# ---------------------------------------------------------------------------
+_args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) TIMDO_FORMAT="json"; FORMAT_EXPLICIT=1 ;;
+    --text) TIMDO_FORMAT="text"; FORMAT_EXPLICIT=1 ;;
+    --no-color|--no-colour) NO_COLOR=1 ;;
+    --as)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: --as needs an email address, e.g. --as robin@example.com" >&2
+        exit 1
+      fi
+      TIMDO_AS="$2"; shift ;;
+    --as=*) TIMDO_AS="${1#--as=}" ;;
+    --) shift; _args+=("$@"); break ;;
+    *) _args+=("$1") ;;
+  esac
+  shift
+done
+set -- ${_args[@]+"${_args[@]}"}
+
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/timdo.XXXXXX")
+trap 'rm -rf "$TMPD"' EXIT
+
+# ---------------------------------------------------------------------------
+# Colour (only on a terminal, and never when NO_COLOR is set)
+# ---------------------------------------------------------------------------
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]; then
+  B=$'\e[1m'; D=$'\e[2m'; R=$'\e[0m'; GRN=$'\e[32m'; YEL=$'\e[33m'; CYN=$'\e[36m'; RED=$'\e[31m'
+  COLORS='{"bold":"\u001b[1m","dim":"\u001b[2m","reset":"\u001b[0m","green":"\u001b[32m","yellow":"\u001b[33m","cyan":"\u001b[36m","red":"\u001b[31m","magenta":"\u001b[35m"}'
+else
+  B=""; D=""; R=""; GRN=""; YEL=""; CYN=""; RED=""
+  COLORS='{}'
+fi
+if [[ -t 1 ]]; then
+  COLS=$(tput cols 2>/dev/null || echo 120)
+  [[ "$COLS" =~ ^[0-9]+$ ]] || COLS=120
+else
+  COLS=0 # 0 = not a terminal, so never truncate
+fi
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then E_RED=$'\e[31m'; E_R=$'\e[0m'; else E_RED=""; E_R=""; fi
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+die() {
+  echo "${E_RED}$*${E_R}" >&2
+  exit 1
+}
+
+usage_die() {
+  echo "$*" >&2
+  exit 1
+}
+
+is_text() { [[ "$TIMDO_FORMAT" == "text" ]]; }
+
+# Older write commands (add, update, delete, add-note, epic add/update/delete) printed JSON.
+# They still do when piped (scripts and agents rely on it), unless --text is given.
+# On a terminal they print a readable confirmation instead.
+text_out() { [[ "$TIMDO_FORMAT" == "text" && ( "$FORMAT_EXPLICIT" == "1" || -t 1 ) ]]; }
+
+urlencode() { jq -rn --arg v "$1" '$v | @uri'; }
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Ask before doing something drastic. Returns 0 when confirmed.
+# With --yes it never asks. Off a terminal it refuses (exit 1) and says how to confirm.
+confirm_or_exit() {
+  local prompt="$1" assume_yes="$2"
+  [[ "$assume_yes" == "true" ]] && return 0
+  if [[ -t 0 && -t 1 ]]; then
+    local answer=""
+    read -r -p "$prompt [y/N] " answer || true
+    if [[ "$answer" =~ ^[Yy] ]]; then
+      return 0
+    fi
+    echo "Cancelled. Nothing changed."
+    exit 0
+  fi
+  die "Nothing changed. Re-run with --yes to confirm."
+}
+
+# ---------------------------------------------------------------------------
+# jq library shared by every formatter
+# ---------------------------------------------------------------------------
+read -r -d '' JQ_LIB <<'JQ' || true
+def pad($n): tostring | if length < $n then . + (" " * ($n - length)) else . end;
+def lpad($n): tostring | if length < $n then (" " * ($n - length)) + . else . end;
+def trunc($n): tostring | if ($n > 3) and (length > $n) then .[0:($n - 3)] + "..." else . end;
+def oneline: (. // "") | tostring | gsub("[\r\n\t]+"; " ");
+def maxlen(f): ([.[] | f | tostring | length] + [0]) | max;
+def epoch: (. // "") | tostring | sub(" "; "T") | .[0:16] | (try (strptime("%Y-%m-%dT%H:%M") | mktime) catch null);
+def fdate($f): epoch as $t | if $t == null then "" else ($t | strflocaltime($f)) end;
+def short_dt: fdate("%d %b %H:%M");
+def long_dt: fdate("%d %b %Y %H:%M");
+def day: fdate("%d %b %Y");
+def first_name: (. // "") | tostring | split(" ")[0];
+def c($k): ($C[$k] // "");
+def paint($k): if c($k) == "" or . == "" then . else c($k) + . + c("reset") end;
+def status_order: ({"do":0,"awaiting":1,"delegate":2,"delay":3,"done":4}[.] // 9);
+def who: if .assigneeId == null then "unassigned" elif .isMine == true then "me" else ((.assigneeName // "someone") | first_name) end;
+def where: (.projectName // .category // "") as $p
+  | if .isShared == true then (if ($p | ascii_downcase) == ((.orgName // "") | ascii_downcase) then $p else "\(.orgName // "?")/\($p)" end) else $p end;
+def role_note: if .canEdit == false then "view only" else "" end;
+def task_widths: {t: ([maxlen(.project | oneline), 52] | min), w: maxlen(where), h: maxlen(select(.isShared == true) | who)};
+def task_line($w):
+  . as $task
+  | who as $who
+  | (.project | oneline | if $cols > 0 then trunc($w.t) else . end) as $title
+  | (if .status == "awaiting" then "returns \((.awaitUntil // "no date") | tostring | .[0:10])  " else "" end) as $aw
+  | (if .canEdit == false then "view only  " else "" end) as $ro
+  | (2 + 4 + 2 + 8 + 2 + $w.t + 2 + $w.w + 2 + (if $w.h > 0 then $w.h + 2 else 0 end) + ($aw | length) + ($ro | length)) as $used
+  | ((.reason // "") | oneline | if $cols > 0 then trunc([$cols - $used - 2, 12] | max) else . end) as $why
+  | ("  " + ("[\(.priority)]" | lpad(4) | paint("bold"))
+    + "  " + ((.id // "")[0:8] | paint("dim"))
+    + "  " + ($title | pad($w.t))
+    + "  " + (where | pad($w.w) | paint("cyan"))
+    + (if $w.h > 0 then "  " + (if $task.isShared == true then $who else "" end | pad($w.h)
+        | paint(if $who == "me" then "green" elif $who == "unassigned" then "dim" else "yellow" end)) else "" end)
+    + "  " + ($aw | paint("yellow")) + ($ro | paint("red"))
+    + (if $why == "" then "" else ("- " + $why | paint("dim")) end))
+  | sub(" +$"; "");
+def activity_line($aw):
+  "  " + ((.createdAt | short_dt) | pad(12) | paint("dim"))
+  + "  " + ((.actorName // "Someone") | pad($aw) | paint("bold"))
+  + "  " + (.summary // .action // "" | oneline)
+  + (if .projectName then "  " + ("[\(.projectName)]" | paint("cyan")) else "" end);
+def activity_lines: (maxlen(.actorName // "Someone")) as $aw | .[] | activity_line($aw);
+def note_lines:
+  maxlen(.authorName // "Someone") as $aw
+  | .[]
+  | "  " + ((.createdAt | long_dt) | pad(17) | paint("dim"))
+    + "  " + ((.authorName // "Someone") | pad($aw) | paint("bold"))
+    + "  " + ((.note // "") | tostring | gsub("\n"; "\n" + (" " * (2 + 17 + 2 + $aw + 2))))
+    + (if .gmailThreadId then ("  (thread: \(.gmailThreadId))" | paint("dim")) else "" end);
+JQ
+
+# jqt PROGRAM [jq options...]: run a jq program with the shared library and raw output
+jqt() {
+  local prog="$1"; shift
+  jq -r --argjson C "$COLORS" --argjson cols "$COLS" "$@" "$JQ_LIB
+$prog"
+}
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+require_secret() {
+  if [[ -z "${TIMDO_SECRET:-}" ]]; then
+    echo "Error: TIMDO_SECRET not set. Either export it or add it to $TIMDO_CONFIG" >&2
+    echo "  echo 'TIMDO_SECRET=\"your-secret\"' > $TIMDO_CONFIG" >&2
+    exit 1
+  fi
+}
+
+# Print a readable message for a failed API call and exit non-zero.
+api_error() {
+  local code="$1" file="$2" msg=""
+  msg=$(jq -r '
+      if type == "object" then
+        if (.error | type) == "string" then
+          (.error + (if (.message | type) == "string" and .message != .error then ": " + .message else "" end))
+        elif (.error | type) == "object" then
+          ((.error.issues // [])[0] | if . then ((.path // []) | map(tostring) | join(".")) + (if (.path // []) | length > 0 then ": " else "" end) + (.message // "invalid input") else null end)
+          // (.error.message // "invalid input")
+        elif (.message | type) == "string" then .message
+        else empty end
+      else empty end' "$file" 2>/dev/null || true)
+  if [[ -z "$msg" ]]; then
+    msg=$(head -c 300 "$file" | tr '\n' ' ')
+    [[ -z "$msg" ]] && msg="HTTP $code"
+  fi
+  # "You have view-only access to X" reads best as "View only: you have view-only access to X"
+  local soft="$msg"
+  if [[ "$soft" =~ ^[A-Z][a-z] ]]; then soft="$(lower "${soft:0:1}")${soft:1}"; fi
+  local prefix
+  case "$code" in
+    401) prefix="Not signed in" ;;
+    403) if [[ "$msg" == *view-only* ]]; then prefix="View only"; else prefix="Not allowed"; fi ;;
+    404) prefix="Not found" ;;
+    400|422) prefix="Invalid request" ;;
+    *) prefix="Error ($code)" ;;
+  esac
+  if [[ "$msg" == *"Invalid internal secret"* ]]; then
+    die "Not signed in: the API rejected TIMDO_SECRET. Check the environment or $TIMDO_CONFIG (API: $TIMDO_API)."
+  fi
+  local who_note=""
+  [[ -n "$TIMDO_AS" && ( "$code" == "403" || "$code" == "404" ) && "$msg" != *"$TIMDO_AS"* ]] && who_note=" (acting as $TIMDO_AS)"
+  die "$prefix: $soft$who_note"
+}
+
+# api METHOD PATH [curl args...]: prints the response body, or exits non-zero with the API error
+api() {
+  local method="$1" path="$2"
+  shift 2
+  require_secret
+  local headers=(-H "X-Internal-Secret: $TIMDO_SECRET" -H "Content-Type: application/json")
+  [[ -n "$TIMDO_AS" ]] && headers+=(-H "X-Timdo-User: $TIMDO_AS")
+  local out err code
+  out=$(mktemp "$TMPD/resp.XXXXXX")
+  err="$out.err"
+  if ! code=$(curl -sS -o "$out" -w '%{http_code}' -X "$method" "${headers[@]}" "$@" "${TIMDO_API}${path}" 2>"$err"); then
+    die "Error: could not reach the TimDo API at $TIMDO_API ($(head -c 200 "$err" | tr '\n' ' '))"
+  fi
+  if [[ "$code" -ge 400 ]]; then
+    api_error "$code" "$out"
+  fi
+  cat "$out"
+}
+
+# Cached GET for the lifetime of one command (each command makes few distinct reads)
+api_cached() {
+  local key f
+  key=$(printf '%s|%s' "$TIMDO_AS" "$1" | md5sum | cut -c1-16)
+  f="$TMPD/cache-$key"
+  if [[ ! -f "$f" ]]; then
+    api GET "$1" > "$f.tmp"
+    mv "$f.tmp" "$f"
+  fi
+  cat "$f"
+}
+
+cache_clear() { rm -f "$TMPD"/cache-* 2>/dev/null || true; }
+
+# Optional reads: an empty array (or object) when the endpoint fails, so older APIs still work
+api_optional() {
+  local fallback="${2:-[]}"
+  ( api_cached "$1" ) 2>/dev/null || echo "$fallback"
+}
+
+# ---------------------------------------------------------------------------
+# Lookups
+# ---------------------------------------------------------------------------
+me_json() { api_cached /users/me; }
+my_id() { me_json | jq -r '.id'; }
+all_tasks() { api_cached /projects; }
+sharing_json() { api_cached /organisations/sharing; }
+orgs_json() { api_cached /organisations; }
+
+# resolve_task <id or prefix>: prints one task (TaskView) or exits with a clear message
+resolve_task() {
+  local q="$1"
+  [[ -z "$q" ]] && die "Error: a task ID is needed."
+  local matches count
+  matches=$(all_tasks | jq --arg id "$q" '[.[] | select((.id // "") | startswith($id))]')
+  count=$(echo "$matches" | jq 'length')
+  if [[ "$count" -eq 1 ]]; then
+    echo "$matches" | jq '.[0]'
+    return
+  fi
+  if [[ "$count" -gt 1 ]]; then
+    local exact
+    exact=$(echo "$matches" | jq --arg id "$q" '[.[] | select(.id == $id)][0] // empty')
+    if [[ -n "$exact" ]]; then echo "$exact"; return; fi
+    {
+      echo "Error: \"$q\" matches $count tasks. Use more characters of the ID:"
+      echo "$matches" | jq -r '(.[0:10][] | "  \(.id[0:8])  \(.project)  [\(.projectName // .category // "")]"), (if length > 10 then "  ... and \(length - 10) more" else empty end)'
+    } >&2
+    exit 1
+  fi
+  if [[ "$q" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+    api GET "/projects/$q"
+    return
+  fi
+  local who="you"
+  [[ -n "$TIMDO_AS" ]] && who="$TIMDO_AS"
+  die "Not found: no task that $who can see has an ID starting \"$q\"."
+}
+
+resolve_task_id() { resolve_task "$1" | jq -r '.id'; }
+
+# Resolve an epic identifier (ID prefix or exact/contained title) to an epic ID.
+# Falls back to the input so a full ID the list does not show still works.
+resolve_epic_id() {
+  local input="$1"
+  [[ -z "$input" ]] && { echo ""; return; }
+  local epics_raw
+  epics_raw=$(api_cached /epics)
+  echo "$epics_raw" | jq -r --arg input "$input" '
+    ($input | ascii_downcase) as $q
+    | ([.[] | select(.id | startswith($input))][0].id)
+      // ([.[] | select((.title // "") | ascii_downcase == $q)][0].id)
+      // ([.[] | select((.title // "") | ascii_downcase | contains($q))][0].id)
+      // $input'
+}
+
+resolve_goal_id() {
+  local input="$1"
+  [[ -z "$input" ]] && { echo ""; return; }
+  local goals_raw
+  goals_raw=$(api_cached /goals)
+  echo "$goals_raw" | jq -r --arg input "$input" '
+    ($input | ascii_downcase) as $q
+    | ([.[] | select(.id | startswith($input))][0].id)
+      // ([.[] | select((.title // "") | ascii_downcase == $q)][0].id)
+      // ([.[] | select((.title // "") | ascii_downcase | contains($q))][0].id)
+      // $input'
+}
+
+# resolve_org <name|id|id-prefix|slug|"personal">: prints the workspace from /organisations/sharing
+resolve_org() {
+  local q="$1"
+  [[ -z "$q" ]] && die "Error: a workspace name is needed."
+  local found
+  found=$(sharing_json | jq --arg q "$q" '
+    ($q | ascii_downcase) as $l
+    | ([.[] | select(.id == $q)][0])
+      // ([.[] | select(($l == "personal") and .isPersonal == true)][0])
+      // ([.[] | select((.name // "") | ascii_downcase == $l)][0])
+      // ([.[] | select((.slug // "") | ascii_downcase == $l)][0])
+      // ([.[] | select(.id | startswith($q))][0])
+      // (if ([.[] | select((.name // "") | ascii_downcase | contains($l))] | length) == 1
+          then [.[] | select((.name // "") | ascii_downcase | contains($l))][0] else empty end)
+      // empty')
+  if [[ -z "$found" ]]; then
+    local names
+    names=$(sharing_json | jq -r '[.[].name] | join(", ")')
+    die "Not found: no workspace called \"$q\". Your workspaces: $names"
+  fi
+  echo "$found"
+}
+
+# resolve_member <orgJson> <name|email|me>: prints {userId,userName,userEmail,role}
+resolve_member() {
+  local org="$1" q="$2"
+  local found
+  if [[ "$(lower "$q")" == "me" ]]; then
+    found=$(echo "$org" | jq '[.members[] | select(.isMe == true)][0] // empty')
+    if [[ -z "$found" ]]; then
+      found=$(echo "$org" | jq --arg me "$(my_id)" '[.members[] | select(.userId == $me)][0] // empty')
+    fi
+  else
+    found=$(echo "$org" | jq --arg q "$q" '
+      ($q | ascii_downcase) as $l
+      | [.members[] | . + {userName: (.userName // .name), userEmail: (.userEmail // .email)}] as $m
+      | ([$m[] | select((.userEmail // "") | ascii_downcase == $l)])
+        as $byEmail
+      | if ($byEmail | length) > 0 then $byEmail[0]
+        else
+          ([$m[] | select(.userId == $q)])[0]
+          // ([$m[] | select((.userName // "") | ascii_downcase == $l)])[0]
+          // (([$m[] | select((.userName // "") | ascii_downcase | split(" ")[0] == $l)]) | if length == 1 then .[0] else empty end)
+          // (([$m[] | select(((.userName // "") + " " + (.userEmail // "")) | ascii_downcase | contains($l))]) | if length == 1 then .[0] else empty end)
+          // empty
+        end')
+  fi
+  if [[ -z "$found" ]]; then
+    local org_name members
+    org_name=$(echo "$org" | jq -r '.name')
+    members=$(echo "$org" | jq -r '[.members[] | "\(.userName // .name) <\(.userEmail // .email)>"] | join(", ")')
+    die "Not found: nobody in \"$org_name\" matches \"$q\". Members: $members. To add someone: timdo workspace share \"$org_name\" <email>"
+  fi
+  echo "$found"
+}
+
+# resolve_user_anywhere <name|email|me|unassigned>: prints a user id for list filters
+resolve_user_anywhere() {
+  local q="$1" l
+  l=$(lower "$q")
+  case "$l" in
+    me|mine) echo "me"; return ;;
+    unassigned|none|nobody) echo "unassigned"; return ;;
+    mine_or_unassigned|mine-or-unassigned) echo "mine_or_unassigned"; return ;;
+  esac
+  local everyone found count
+  everyone=$(sharing_json | jq '[.[] | .members[]? | . + {userName: (.userName // .name), userEmail: (.userEmail // .email)}] | unique_by(.userId)')
+  found=$(echo "$everyone" | jq --arg q "$q" '
+    ($q | ascii_downcase) as $l
+    | ([.[] | select(.userId == $q or ((.userEmail // "") | ascii_downcase) == $l or ((.userName // "") | ascii_downcase) == $l)])
+      as $exact
+    | if ($exact | length) > 0 then $exact
+      else [.[] | select((((.userName // "") + " " + (.userEmail // "")) | ascii_downcase | contains($l)))] end')
+  count=$(echo "$found" | jq 'length')
+  if [[ "$count" -eq 0 ]]; then
+    die "Not found: nobody in your workspaces matches \"$q\"."
+  fi
+  if [[ "$count" -gt 1 ]]; then
+    die "Error: \"$q\" matches several people: $(echo "$found" | jq -r '[.[] | "\(.userName) <\(.userEmail)>"] | join(", ")'). Use their email."
+  fi
+  echo "$found" | jq -r '.[0].userId'
+}
+
+# resolve_project <id|KEY|name|"Workspace/Project"> [orgId]: prints {id,key,name,orgId,orgName,role,...}
+resolve_project() {
+  local q="$1" org_id="${2:-}"
+  local found count
+  found=$(sharing_json | jq --arg q "$q" --arg org "$org_id" '
+    ($q | ascii_downcase) as $l
+    | [.[] | . as $o | (.projects // [])[] | . + {orgId: $o.id, orgName: $o.name, role: $o.role, isPersonal: $o.isPersonal}]
+    | map(select($org == "" or .orgId == $org)) as $all
+    | ([$all[] | select(.id == $q)]) as $byId
+    | if ($byId | length) > 0 then $byId
+      else
+        ([$all[] | select(((.orgName // "") + "/" + (.name // "")) | ascii_downcase == $l)]) as $byPath
+        | if ($byPath | length) > 0 then $byPath
+          else
+            ([$all[] | select((.name // "") | ascii_downcase == $l)]) as $byName
+            | if ($byName | length) > 0 then $byName
+              else [$all[] | select((.key // "") | ascii_downcase == $l)] end
+          end
+      end')
+  count=$(echo "$found" | jq 'length')
+  if [[ "$count" -eq 0 ]]; then
+    die "Not found: no project called \"$q\". See: timdo workspace list"
+  fi
+  if [[ "$count" -gt 1 ]]; then
+    die "Error: \"$q\" matches several projects: $(echo "$found" | jq -r '[.[] | "\(.orgName)/\(.name)"] | join(", ")'). Use \"Workspace/Project\"."
+  fi
+  echo "$found" | jq '.[0]'
+}
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+usage_list() {
+  cat <<'EOF'
+Usage: timdo list [all|do|delay|done|delegate|awaiting] [options]
+
+Lists the tasks you can see in every workspace you belong to. Shared tasks
+show their workspace/project and who they are assigned to.
+
+Filters (applied by the server):
+  -p, --project <name>        Project (category) name, e.g. Solfit
+  --project-id <id|KEY>       One project by id or key (e.g. SOL)
+  -w, --workspace <name>      One workspace, e.g. "Migrating Dragons" or personal
+  -e, --epic <title|id>       Tasks in an epic
+  -g, --goal <title|id>       Tasks linked to one of your life goals
+  --customer <name>           Customer/company tag
+  --tag <tag>                 Tag keyword
+  --related-to <id>           Tasks linked to another task
+  --mine                      Assigned to you (or unassigned and created by you)
+  --unassigned                Nobody is assigned
+  --assignee <who>            me, unassigned, mine_or_unassigned, a name or an email
+Filters (applied locally):
+  --shared                    Only tasks in shared workspaces
+  --no-epic, --no-goal, --no-category
+  --unlinked <epic|goal|category|any>
+
+Examples:
+  timdo list do --mine
+  timdo list do -w "Migrating Dragons" --assignee robin
+  timdo --json list awaiting
+EOF
+}
+
+cmd_list() {
+  local filter="all" category="" project_id="" workspace="" epic="" goal="" customer="" tag=""
+  local related_to="" assignee="" shared=false no_epic=false no_goal=false no_category=false unlinked=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage_list; exit 0 ;;
+      -p|--category|--project|--project-category) category="$2"; shift 2 ;;
+      --project-id) project_id="$2"; shift 2 ;;
+      -w|--workspace|--org) workspace="$2"; shift 2 ;;
+      -e|--epic) epic="$2"; shift 2 ;;
+      -g|--goal) goal="$2"; shift 2 ;;
+      --customer) customer="$2"; shift 2 ;;
+      --tag) tag="$2"; shift 2 ;;
+      --related-to) related_to="$2"; shift 2 ;;
+      --mine) assignee="me"; shift ;;
+      --unassigned) assignee="unassigned"; shift ;;
+      --assignee) assignee="$2"; shift 2 ;;
+      --shared) shared=true; shift ;;
+      --no-epic) no_epic=true; shift ;;
+      --no-goal) no_goal=true; shift ;;
+      --no-category|--no-cat) no_category=true; shift ;;
+      --unlinked) unlinked="$2"; shift 2 ;;
+      do|delay|done|delegate|awaiting|all) filter="$1"; shift ;;
+      *) usage_die "Unknown option for list: $1 (see: timdo list --help)" ;;
+    esac
+  done
+
+  local params=()
+  [[ -n "$category" ]] && params+=("category=$(urlencode "$category")")
+  if [[ -n "$project_id" ]]; then
+    params+=("projectId=$(urlencode "$(resolve_project "$project_id" | jq -r '.id')")")
+  fi
+  if [[ -n "$workspace" ]]; then
+    params+=("orgId=$(urlencode "$(resolve_org "$workspace" | jq -r '.id')")")
+  fi
+  [[ -n "$epic" ]] && params+=("epicId=$(urlencode "$(resolve_epic_id "$epic")")")
+  [[ -n "$goal" ]] && params+=("goalId=$(urlencode "$(resolve_goal_id "$goal")")")
+  [[ -n "$customer" ]] && params+=("customer=$(urlencode "$customer")")
+  [[ -n "$tag" ]] && params+=("tag=$(urlencode "$tag")")
+  [[ -n "$related_to" ]] && params+=("relatedTo=$(urlencode "$related_to")")
+  if [[ -n "$assignee" ]]; then
+    params+=("assignee=$(urlencode "$(resolve_user_anywhere "$assignee")")")
+  fi
+
+  local path="/projects"
+  if [[ ${#params[@]} -gt 0 ]]; then
+    path="$path?$(IFS='&'; echo "${params[*]}")"
+  fi
+
+  local raw
+  raw=$(api GET "$path")
+
+  case "$filter" in
+    do|delay|done|delegate|awaiting|all) ;;
+    *) usage_die "Unknown filter: $filter. Use: all, do, delay, done, delegate, awaiting" ;;
+  esac
+
+  local selected
+  selected=$(echo "$raw" | jq --arg f "$filter" \
+    --argjson shared "$shared" --argjson noEpic "$no_epic" --argjson noGoal "$no_goal" \
+    --argjson noCat "$no_category" --arg unlinked "$unlinked" '
+    def blank: . == null or . == "";
+    [.[]
+      | select(.isDeleted != true)
+      | select($f == "all" or .status == $f)
+      | select(($shared | not) or .isShared == true)
+      | select((($noEpic or $unlinked == "epic") | not) or (.epicId | blank))
+      | select((($noGoal or $unlinked == "goal") | not) or (.goalId | blank))
+      | select((($noCat or $unlinked == "category") | not) or (.category | blank))
+      | select($unlinked != "any" or (.epicId | blank) or (.goalId | blank) or (.category | blank))
+    ]
+    | if $f == "awaiting" then sort_by(.awaitUntil // "9999") else sort_by(-.priority) end')
+
+  if ! is_text; then
+    echo "$selected"
+    return
+  fi
+
+  if [[ "$(echo "$selected" | jq 'length')" -eq 0 ]]; then
+    echo "No tasks found."
+    return
+  fi
+
+  if [[ "$filter" == "all" ]]; then
+    echo "$selected" | jqt '
+      task_widths as $w
+      | group_by(.status) | sort_by(.[0].status | status_order) | .[]
+      | ("", ("\(.[0].status | ascii_upcase) (\(length))" | paint("bold"))),
+        (sort_by(-.priority) | .[] | task_line($w))'
+  else
+    echo "$selected" | jqt 'task_widths as $w | .[] | task_line($w)'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# get
+# ---------------------------------------------------------------------------
+cmd_get() {
+  local id="${1:-}"
+  if [[ -z "$id" || "$id" == "-h" || "$id" == "--help" ]]; then
+    echo "Usage: timdo get <id>   Show a task with its workspace, project, people, notes and activity"
+    [[ -z "$id" ]] && exit 1 || exit 0
+  fi
+  local task full_id
+  task=$(resolve_task "$id")
+  full_id=$(echo "$task" | jq -r '.id')
+
+  local updates linked activity
+  updates=$(api GET "/projects/$full_id/updates")
+  linked=$( (api GET "/tasks/$full_id" 2>/dev/null || echo '{}') | jq '.linkedTasks // []')
+  activity=$( (api GET "/activity?taskId=$(urlencode "$full_id")&limit=10" 2>/dev/null) || echo '[]')
+
+  if ! is_text; then
+    echo "$task" | jq --argjson updates "$updates" --argjson linked "$linked" --argjson activity "$activity" \
+      '. + {updates: $updates, linkedTasks: $linked, activity: $activity}'
+    return
+  fi
+
+  local epic_title="" goal_title=""
+  local epic_id goal_id
+  epic_id=$(echo "$task" | jq -r '.epicId // empty')
+  goal_id=$(echo "$task" | jq -r '.goalId // empty')
+  if [[ -n "$epic_id" ]]; then
+    epic_title=$( (api GET "/epics/$epic_id" 2>/dev/null || echo '{}') | jq -r '.title // empty')
+  fi
+  if [[ -n "$goal_id" ]]; then
+    goal_title=$(api_optional /goals | jq -r --arg g "$goal_id" '[.[] | select(.id == $g)][0].title // empty')
+  fi
+
+  echo "$task" | jqt '
+    def row($k; $v): if ($v // "") == "" then empty else "  " + ($k | pad(15) | paint("dim")) + ($v | tostring | gsub("\n"; "\n" + (" " * 17))) end;
+    (("[\(.priority)] " + .project) | paint("bold")),
+    row("ID:"; .id),
+    row("Status:"; .status + (if .status == "awaiting" then " until \(.awaitUntil // "no date")" else "" end) + "   size \(.size // "?")"),
+    row("Workspace:"; (.orgName // "") + (if .isShared == true then "  (shared, your role: \(.myRole // "?"))" else (if .orgName then "  (personal)" else "" end) end)),
+    row("Project:"; (.projectName // .category // "") + (if .projectKey then " (\(.projectKey))" else "" end)),
+    row("Epic:"; if .epicId then (if $epic != "" then "\($epic) (\(.epicId[0:8]))" else .epicId end) else "" end),
+    row("Life goal:"; if .goalId then (if $goal != "" then "\($goal) (\(.goalId[0:8]))" else .goalId end) else "" end),
+    row("Assignee:"; if .assigneeId == null then "unassigned" else (.assigneeName // .assigneeId) + (if .isMine == true then " (you)" else "" end) end),
+    row("Created by:"; ((.reporterName // "") + "  " + (.createdAt | long_dt)) | sub("^ +"; "")),
+    row("Last updated:"; ((.updatedByName // "") + "  " + (.updatedAt | long_dt)) | sub("^ +"; "")),
+    row("Access:"; if .canEdit == false then "view only" else "" end),
+    row("Customer:"; .customer),
+    row("Tags:"; .tags),
+    row("Why:"; .reason),
+    row("Gmail thread:"; .gmailThreadId),
+    row("Notes:"; .notes)
+  ' --arg epic "$epic_title" --arg goal "$goal_title"
+
+  if [[ "$(echo "$linked" | jq 'length')" -gt 0 ]]; then
+    echo ""
+    echo "${B}Linked tasks ($(echo "$linked" | jq 'length'))${R}"
+    echo "$linked" | jq -r '.[] | "  \(.relationType | . + (" " * ([12 - length, 0] | max)))  \(.shortId)  (\(.status), P\(.priority))  \(.title)"'
+  fi
+
+  echo ""
+  echo "${B}Notes ($(echo "$updates" | jq 'length'))${R}"
+  if [[ "$(echo "$updates" | jq 'length')" -eq 0 ]]; then
+    echo "  (none yet)"
+  else
+    echo "$updates" | jqt 'sort_by(.createdAt) | note_lines'
+  fi
+
+  if [[ "$(echo "$activity" | jq 'length')" -gt 0 ]]; then
+    echo ""
+    echo "${B}Recent activity${R}"
+    echo "$activity" | jqt 'activity_lines'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# add / update
+# ---------------------------------------------------------------------------
+usage_add() {
+  cat <<'EOF'
+Usage: timdo add "Task title" -p <project> [options]
+
+  -p, --project <name>         Project (category) name. Mandatory unless --project-id is given.
+                               A name already used in a shared workspace puts the task there;
+                               a brand-new name creates the project in your personal workspace.
+  --project-id <id|KEY|path>   Exact project, e.g. SOL or "Migrating Dragons/Solfit"
+  --assign <who>               me (default), none, or a workspace member's name or email
+  -e, --epic <title|id>        Epic
+  -g, --goal <title|id>        One of your life goals (private to you)
+  -r, --reason "..."           Why it matters
+  -s, --status <status>        do (default), delay, delegate, awaiting, done
+  --priority <1-10>            Default 5
+  --size <* to *****>          Default ***
+  -n, --notes "..."            Notes or next step
+  --await-until YYYY-MM-DD     Return date (needs --status awaiting)
+  --thread <threadId>          Gmail thread
+  --customer <name>            Customer/company tag
+  --tags <a,b>                 Comma-separated tags
+EOF
+}
+
+# Resolve an assignee query for a project in a workspace. Prints a user id or "null".
+assignee_for_org() {
+  local org_id="$1" q="$2" l
+  l=$(lower "$q")
+  case "$l" in
+    none|nobody|unassigned|null) echo "null"; return ;;
+  esac
+  local org
+  org=$(sharing_json | jq --arg id "$org_id" '[.[] | select(.id == $id)][0] // empty')
+  if [[ -z "$org" ]]; then
+    if [[ "$l" == "me" ]]; then my_id; return; fi
+    die "Not found: could not load the members of that workspace to assign \"$q\"."
+  fi
+  resolve_member "$org" "$q" | jq -r '.userId'
+}
+
+# Find the workspace a category name will land in when written (editable match first, else personal)
+org_for_category() {
+  local category="$1"
+  sharing_json | jq -r --arg c "$category" '
+    ($c | ascii_downcase) as $l
+    | [.[] | . as $o | (.projects // [])[] | select((.name // "") | ascii_downcase == $l) | {orgId: $o.id, role: $o.role}]
+    | (map(select(.role != "viewer"))[0].orgId) // (.[0].orgId) // empty'
+}
+
+personal_org_id() {
+  sharing_json | jq -r '[.[] | select(.isPersonal == true)][0].id // empty'
+}
+
+describe_task() {
+  # One-line summary of a task for confirmations
+  jqt '"\((.id // "")[0:8])  \"\(.project)\"  " + (where | paint("cyan"))
+    + (if .assigneeId == null then "  unassigned" else "  assigned to \(.assigneeName // .assigneeId)" end)
+    + "  [\(.status), P\(.priority), \(.size)]"'
+}
+
+cmd_add() {
+  local project="" reason="" status="do" priority=5 size="***" notes="" awaitUntil="" gmailThreadId=""
+  local category="" project_id="" epic="" goal="" assign="" assign_set=false customer="" tags=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage_add; exit 0 ;;
+      --reason|-r) reason="$2"; shift 2 ;;
+      --status|-s) status="$2"; shift 2 ;;
+      --priority) priority="$2"; shift 2 ;;
+      -p|--category|--project) category="$2"; shift 2 ;;
+      --project-id) project_id="$2"; shift 2 ;;
+      -e|--epic) epic="$2"; shift 2 ;;
+      -g|--goal) goal="$2"; shift 2 ;;
+      --size) size="$2"; shift 2 ;;
+      --notes|-n) notes="$2"; shift 2 ;;
+      --await-until) awaitUntil="$2"; shift 2 ;;
+      --thread) gmailThreadId="$2"; shift 2 ;;
+      --customer) customer="$2"; shift 2 ;;
+      --tags|--tag) tags="$2"; shift 2 ;;
+      --assign|--assignee|--assign-to) assign="$2"; assign_set=true; shift 2 ;;
+      --unassigned) assign="none"; assign_set=true; shift ;;
+      -*) usage_die "Unknown option for add: $1 (see: timdo add --help)" ;;
+      *)
+        if [[ -z "$project" ]]; then
+          project="$1"; shift
+        else
+          usage_die "Unexpected argument: $1. Quote the task title."
+        fi ;;
+    esac
+  done
+
+  if [[ -z "$project" ]]; then
+    usage_add >&2
+    exit 1
+  fi
+  if [[ -z "$category" && -z "$project_id" ]]; then
+    die "Error: -p/--project is mandatory when adding a task (or give --project-id)."
+  fi
+  if ! [[ "$priority" =~ ^[0-9]+$ ]]; then
+    die "Error: --priority must be a number from 1 to 10."
+  fi
+  if [[ -n "$awaitUntil" && "$status" != "awaiting" ]]; then
+    echo "Warning: --await-until passed but status is '$status', not 'awaiting'. Use --status awaiting to set an awaiting task." >&2
+  fi
+
+  local resolved_project_id="" target_org=""
+  if [[ -n "$project_id" ]]; then
+    local proj
+    proj=$(resolve_project "$project_id")
+    resolved_project_id=$(echo "$proj" | jq -r '.id')
+    target_org=$(echo "$proj" | jq -r '.orgId')
+  fi
+
+  local assignee_id=""
+  if [[ "$assign_set" == true ]]; then
+    if [[ -z "$target_org" ]]; then
+      target_org=$(org_for_category "$category")
+      [[ -z "$target_org" ]] && target_org=$(personal_org_id)
+    fi
+    assignee_id=$(assignee_for_org "$target_org" "$assign")
+  fi
+
+  local epic_id="" goal_id=""
+  [[ -n "$epic" ]] && epic_id=$(resolve_epic_id "$epic")
+  [[ -n "$goal" ]] && goal_id=$(resolve_goal_id "$goal")
+
+  local body
+  body=$(jq -n \
+    --arg project "$project" --arg reason "$reason" --arg status "$status" \
+    --argjson priority "$priority" --arg size "$size" --arg notes "$notes" \
+    --arg awaitUntil "$awaitUntil" --arg gmailThreadId "$gmailThreadId" \
+    --arg category "$category" --arg projectId "$resolved_project_id" \
+    --arg customer "$customer" --arg tags "$tags" --arg epicId "$epic_id" --arg goalId "$goal_id" \
+    --argjson assignSet "$assign_set" --arg assigneeId "$assignee_id" \
+    '{
+      project: $project,
+      reason: $reason,
+      status: $status,
+      priority: $priority,
+      size: $size,
+      notes: $notes,
+      awaitUntil: (if $awaitUntil == "" then null else $awaitUntil end),
+      gmailThreadId: (if $gmailThreadId == "" then null else $gmailThreadId end),
+      category: (if $category == "" then null else $category end),
+      customer: (if $customer == "" then null else $customer end),
+      tags: (if $tags == "" then null else $tags end),
+      epicId: (if $epicId == "" then null else $epicId end),
+      goalId: (if $goalId == "" then null else $goalId end)
+    }
+    + (if $projectId != "" then {projectId: $projectId} else {} end)
+    + (if $assignSet then {assigneeId: (if $assigneeId == "null" or $assigneeId == "" then null else $assigneeId end)} else {} end)')
+
+  local created
+  created=$(api POST /projects -d "$body")
+  if text_out; then
+    echo "${GRN}Added${R} $(echo "$created" | describe_task)"
+  else
+    echo "$created" | jq '.'
+  fi
+}
+
+usage_update() {
+  cat <<'EOF'
+Usage: timdo update <id> [options]
+
+  --project "..."              Rename the task (historical flag name)
+  -p, --category <name>        Move to another project by name
+  --project-id <id|KEY|path>   Move to an exact project, e.g. SOL or "Migrating Dragons/Solfit"
+  --assign <who>               me, none, or a workspace member's name or email
+  --claim                      Assign it to yourself
+  --unassign                   Leave it unassigned
+  --done --do --delay --awaiting --delegate, or -s/--status <status>
+  --await-until YYYY-MM-DD     Return date for awaiting tasks
+  --priority <1-10>  --size <*..*****>  -r/--reason  -n/--notes  --customer  --tags
+  -e, --epic <title|id|none>   Epic ("none" clears it)
+  -g, --goal <title|id|none>   Your life goal ("none" clears it)
+  --thread <threadId>          Gmail thread
+
+Viewers cannot edit; the API refuses with "View only: ...".
+EOF
+}
+
+cmd_update() {
+  local id="${1:-}"
+  if [[ -z "$id" || "$id" == "-h" || "$id" == "--help" ]]; then
+    usage_update
+    [[ -z "$id" ]] && exit 1 || exit 0
+  fi
+  shift
+  local body="{}" assign="" assign_set=false project_q=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage_update; exit 0 ;;
+      --project|--title) body=$(echo "$body" | jq --arg v "$2" '. + {project: $v}'); shift 2 ;;
+      --reason|-r) body=$(echo "$body" | jq --arg v "$2" '. + {reason: $v}'); shift 2 ;;
+      --status|-s) body=$(echo "$body" | jq --arg v "$2" '. + {status: $v}'); shift 2 ;;
+      --priority)
+        [[ "$2" =~ ^[0-9]+$ ]] || die "Error: --priority must be a number from 1 to 10."
+        body=$(echo "$body" | jq --argjson v "$2" '. + {priority: $v}'); shift 2 ;;
+      -p|--category) body=$(echo "$body" | jq --arg v "$2" '. + {category: $v}'); shift 2 ;;
+      --project-id) project_q="$2"; shift 2 ;;
+      -e|--epic)
+        local resolved_epic=""
+        if [[ "$(lower "$2")" != "none" && -n "$2" ]]; then resolved_epic=$(resolve_epic_id "$2"); fi
+        body=$(echo "$body" | jq --arg v "$resolved_epic" '. + {epicId: (if $v == "" then null else $v end)}'); shift 2 ;;
+      -g|--goal)
+        local resolved_goal=""
+        if [[ "$(lower "$2")" != "none" && -n "$2" ]]; then resolved_goal=$(resolve_goal_id "$2"); fi
+        body=$(echo "$body" | jq --arg v "$resolved_goal" '. + {goalId: (if $v == "" then null else $v end)}'); shift 2 ;;
+      --size) body=$(echo "$body" | jq --arg v "$2" '. + {size: $v}'); shift 2 ;;
+      --notes|-n) body=$(echo "$body" | jq --arg v "$2" '. + {notes: $v}'); shift 2 ;;
+      --done) body=$(echo "$body" | jq '. + {status: "done", awaitUntil: null}'); shift ;;
+      --do) body=$(echo "$body" | jq '. + {status: "do", awaitUntil: null}'); shift ;;
+      --delay) body=$(echo "$body" | jq '. + {status: "delay", awaitUntil: null}'); shift ;;
+      --awaiting) body=$(echo "$body" | jq '. + {status: "awaiting"}'); shift ;;
+      --delegate) body=$(echo "$body" | jq '. + {status: "delegate", awaitUntil: null}'); shift ;;
+      --await-until) body=$(echo "$body" | jq --arg v "$2" '. + {awaitUntil: $v}'); shift 2 ;;
+      --thread) body=$(echo "$body" | jq --arg v "$2" '. + {gmailThreadId: $v}'); shift 2 ;;
+      --customer) body=$(echo "$body" | jq --arg v "$2" '. + {customer: $v}'); shift 2 ;;
+      --tags|--tag) body=$(echo "$body" | jq --arg v "$2" '. + {tags: $v}'); shift 2 ;;
+      --claim) assign="me"; assign_set=true; shift ;;
+      --assign|--assignee|--assign-to) assign="$2"; assign_set=true; shift 2 ;;
+      --unassign) assign="none"; assign_set=true; shift ;;
+      *) usage_die "Unknown option for update: $1 (see: timdo update --help)" ;;
+    esac
+  done
+
+  local before full_id
+  before=$(resolve_task "$id")
+  full_id=$(echo "$before" | jq -r '.id')
+
+  # Where the task will live after this update (for assignment checks)
+  local target_org
+  target_org=$(echo "$before" | jq -r '.orgId // empty')
+  if [[ -n "$project_q" ]]; then
+    local proj
+    proj=$(resolve_project "$project_q")
+    body=$(echo "$body" | jq --arg v "$(echo "$proj" | jq -r '.id')" '. + {projectId: $v}')
+    target_org=$(echo "$proj" | jq -r '.orgId')
+  elif [[ "$(echo "$body" | jq -r 'has("category")')" == "true" ]]; then
+    local moved_org
+    moved_org=$(org_for_category "$(echo "$body" | jq -r '.category // ""')")
+    if [[ -n "$moved_org" ]]; then target_org="$moved_org"; else target_org=$(personal_org_id); fi
+  fi
+
+  if [[ "$assign_set" == true ]]; then
+    local assignee_id
+    if [[ "$(lower "$assign")" == "me" ]]; then
+      assignee_id=$(my_id)
+    elif [[ -n "$target_org" ]]; then
+      assignee_id=$(assignee_for_org "$target_org" "$assign")
+    else
+      case "$(lower "$assign")" in
+        none|nobody|unassigned|null) assignee_id="null" ;;
+        *) die "Error: cannot work out which workspace this task is in, so cannot assign \"$assign\"." ;;
+      esac
+    fi
+    body=$(echo "$body" | jq --arg v "$assignee_id" '. + {assigneeId: (if $v == "null" then null else $v end)}')
+  fi
+
+  if [[ "$body" == "{}" ]]; then
+    usage_die "Nothing to update. See: timdo update --help"
+  fi
+
+  # Strip --await-until unless the task is (or is becoming) awaiting
+  local has_await new_status current_status
+  has_await=$(echo "$body" | jq -r '.awaitUntil // empty')
+  new_status=$(echo "$body" | jq -r '.status // empty')
+  current_status=$(echo "$before" | jq -r '.status // empty')
+  local strip_await=false
+  if [[ -n "$has_await" ]]; then
+    if [[ -n "$new_status" && "$new_status" != "awaiting" ]]; then
+      strip_await=true
+    elif [[ -z "$new_status" && "$current_status" != "awaiting" ]]; then
+      strip_await=true
+    fi
+  fi
+  if [[ "$strip_await" == true ]]; then
+    echo "Warning: --await-until passed but status is '${new_status:-$current_status}', not 'awaiting'. Ignoring the date. Use --awaiting to set an awaiting task." >&2
+    body=$(echo "$body" | jq 'del(.awaitUntil)')
+  fi
+
+  local after
+  after=$(api PUT "/projects/$full_id" -d "$body")
+  cache_clear
+
+  if text_out; then
+    local changes
+    changes=$(jq -rn --argjson a "$before" --argjson b "$after" '
+      def show: if . == null or . == "" then "none" else tostring end;
+      [ ["Title", "project"], ["Status", "status"], ["Priority", "priority"], ["Size", "size"],
+        ["Project", "projectName"], ["Workspace", "orgName"], ["Assignee", "assigneeName"],
+        ["Epic", "epicId"], ["Life goal", "goalId"], ["Return date", "awaitUntil"], ["Why", "reason"],
+        ["Customer", "customer"], ["Tags", "tags"], ["Notes", "notes"], ["Gmail thread", "gmailThreadId"] ]
+      | map(. as [$label, $k] | select(($a[$k] // null) != ($b[$k] // null))
+          | if ($k == "epicId" or $k == "goalId") then "  \($label): \($a[$k] | show | .[0:8]) -> \($b[$k] | show | .[0:8])"
+            elif ($k == "assigneeName") then "  \($label): \($a[$k] // "unassigned") -> \($b[$k] // "unassigned")"
+            else "  \($label): \($a[$k] | show) -> \($b[$k] | show)" end)
+      | .[]')
+    echo "${GRN}Updated${R} $(echo "$after" | describe_task)"
+    if [[ -n "$changes" ]]; then echo "$changes"; else echo "  (no changes)"; fi
+  else
+    echo "$after" | jq '.'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# notes, add-note, delete
+# ---------------------------------------------------------------------------
+cmd_add_note() {
+  local id="${1:-}"
+  if [[ -z "$id" || "$id" == "-h" || "$id" == "--help" ]]; then
+    echo "Usage: timdo add-note <id> \"note text\" [--thread <threadId>]   (alias: log)"
+    echo "  Notes are signed with your name and visible to everyone in the task's workspace."
+    [[ -z "$id" ]] && exit 1 || exit 0
+  fi
+  shift
+
+  local note="" gmailThreadId=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --thread) gmailThreadId="$2"; shift 2 ;;
+      *)
+        if [[ -z "$note" ]]; then
+          note="$1"; shift
+        else
+          usage_die "Unexpected argument: $1. Quote the note text."
+        fi ;;
+    esac
+  done
+  [[ -z "$note" ]] && usage_die "Usage: timdo add-note <id> \"note text\" [--thread <threadId>]"
+
+  local task full_id
+  task=$(resolve_task "$id")
+  full_id=$(echo "$task" | jq -r '.id')
+
+  local body result
+  body=$(jq -n --arg note "$note" --arg t "$gmailThreadId" '{note: $note, gmailThreadId: (if $t == "" then null else $t end)}')
+  result=$(api POST "/projects/$full_id/updates" -d "$body")
+  if text_out; then
+    echo "${GRN}Noted${R} on $(echo "$task" | jq -r '"\(.id[0:8])  \"\(.project)\""') as $(echo "$result" | jq -r '.authorName // "you"')."
+  else
+    echo "$result" | jq '.'
+  fi
+}
+
+cmd_notes() {
+  local id="${1:-}"
+  if [[ -z "$id" || "$id" == "-h" || "$id" == "--help" ]]; then
+    echo "Usage: timdo notes <id>   Dated notes on a task, with who wrote each one (alias: updates)"
+    [[ -z "$id" ]] && exit 1 || exit 0
+  fi
+
+  local task full_id updates
+  task=$(resolve_task "$id")
+  full_id=$(echo "$task" | jq -r '.id')
+  updates=$(api GET "/projects/$full_id/updates")
+
+  if ! is_text; then
+    echo "$updates" | jq '.'
+    return
+  fi
+
+  echo "$task" | jqt '"Notes on \"\(.project)\"  " + (where | paint("cyan")) + "  (\($n))"' --argjson n "$(echo "$updates" | jq 'length')"
+  if [[ "$(echo "$updates" | jq 'length')" -eq 0 ]]; then
+    echo "  (none yet)"
+  else
+    echo "$updates" | jqt 'sort_by(.createdAt) | note_lines'
+  fi
+}
+
+cmd_delete() {
+  local id="${1:-}"
+  if [[ -z "$id" || "$id" == "-h" || "$id" == "--help" ]]; then
+    echo "Usage: timdo delete <id>   Soft-delete a task (members and owners only, not viewers)"
+    [[ -z "$id" ]] && exit 1 || exit 0
+  fi
+  local task full_id result
+  task=$(resolve_task "$id")
+  full_id=$(echo "$task" | jq -r '.id')
+  result=$(api DELETE "/projects/$full_id")
+  if text_out; then
+    echo "${GRN}Deleted${R} $(echo "$task" | describe_task)"
+  else
+    echo "$result" | jq '.'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# epics
+# ---------------------------------------------------------------------------
+usage_epic() {
+  cat <<'EOF'
+Usage: timdo epic <list|get|add|update|delete> ...
+
+Epics belong to a project, so everyone in that project's workspace sees them.
+
+  timdo epic list [-p <project>] [-w <workspace>]
+  timdo epic get <id|title>                 Details, people, tasks with assignees, activity
+  timdo epic add "Title" -p <project> [--project-id <id|KEY>] [-g <goal>] [-d "..."] [--status active|completed|on_hold]
+  timdo epic update <id|title> [--title "..."] [-p <project>] [--project-id <id|KEY>] [-g <goal>] [-d "..."]
+                    [--status <s>] [--completed] [--active] [--on-hold]
+  timdo epic delete <id|title>
+
+Life goal links on epics are private: only the epic's creator sees them.
+EOF
+}
+
+epic_line_lib='
+def epic_where: (.category // "") as $p
+  | if .isShared == true then (if ($p | ascii_downcase) == ((.orgName // "") | ascii_downcase) then $p else "\(.orgName // "?")/\($p)" end) else $p end;
+def epic_widths: {t: ([maxlen(.title | oneline), 48] | min), w: maxlen(epic_where)};
+def epic_line($w):
+  "  " + ("\(.progressPercentage // 0)%" | lpad(4) | paint("bold"))
+  + "  " + ((.id // "")[0:8] | paint("dim"))
+  + "  " + (.title | oneline | if $cols > 0 then trunc($w.t) else . end | pad($w.t))
+  + "  " + (epic_where | pad($w.w) | paint("cyan"))
+  + "  " + ("\(.doneTasks // 0)/\(.totalTasks // 0) done" | pad(11))
+  + (if .status != "active" then "  " + (.status | paint("yellow")) else "" end)
+  + (if .isShared == true and .createdByName then "  " + ("by \(.createdByName | first_name)" | paint("dim")) else "" end)
+  + (if .canEdit == false then "  " + ("view only" | paint("red")) else "" end);
+'
+
+describe_epic() {
+  jqt "$epic_line_lib"'"\((.id // "")[0:8])  \"\(.title)\"  " + (epic_where | paint("cyan")) + "  [\(.status)]"'
+}
+
+cmd_epic() {
+  local subcmd="${1:-list}"
+  shift || true
+
+  case "$subcmd" in
+    -h|--help|help) usage_epic ;;
+
+    list)
+      local category="" workspace=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          -h|--help) usage_epic; exit 0 ;;
+          -p|--category|--project) category="$2"; shift 2 ;;
+          -w|--workspace) workspace="$2"; shift 2 ;;
+          *) usage_die "Unknown option for epic list: $1" ;;
+        esac
+      done
+      local path="/epics"
+      [[ -n "$category" ]] && path="$path?category=$(urlencode "$category")"
+      local raw
+      raw=$(api GET "$path")
+      if [[ -n "$workspace" ]]; then
+        local org_id
+        org_id=$(resolve_org "$workspace" | jq -r '.id')
+        raw=$(echo "$raw" | jq --arg o "$org_id" '[.[] | select(.orgId == $o)]')
+      fi
+      if ! is_text; then
+        echo "$raw" | jq '.'
+        return
+      fi
+      if [[ "$(echo "$raw" | jq 'length')" -eq 0 ]]; then
+        echo "No epics found."
+        return
+      fi
+      echo "$raw" | jqt "$epic_line_lib"'epic_widths as $w | sort_by(.status != "active", (.orgName // ""), (.category // ""), .title) | .[] | epic_line($w)'
+      ;;
+
+    add)
+      local title="" category="" project_q="" goal="" description="" status="active"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          -h|--help) usage_epic; exit 0 ;;
+          -p|--category|--project) category="$2"; shift 2 ;;
+          --project-id) project_q="$2"; shift 2 ;;
+          -g|--goal) goal="$2"; shift 2 ;;
+          -d|--description) description="$2"; shift 2 ;;
+          --status) status="$2"; shift 2 ;;
+          -*) usage_die "Unknown option for epic add: $1" ;;
+          *)
+            if [[ -z "$title" ]]; then title="$1"; shift
+            else usage_die "Unexpected argument: $1. Quote the epic title."; fi ;;
+        esac
+      done
+      if [[ -z "$title" ]]; then
+        usage_epic >&2
+        exit 1
+      fi
+      local goal_id="" project_id=""
+      [[ -n "$goal" ]] && goal_id=$(resolve_goal_id "$goal")
+      [[ -n "$project_q" ]] && project_id=$(resolve_project "$project_q" | jq -r '.id')
+      local body
+      body=$(jq -n --arg title "$title" --arg category "$category" --arg goalId "$goal_id" \
+        --arg description "$description" --arg status "$status" --arg projectId "$project_id" \
+        '{
+          title: $title,
+          category: (if $category == "" then null else $category end),
+          goalId: (if $goalId == "" then null else $goalId end),
+          description: (if $description == "" then null else $description end),
+          status: $status
+        } + (if $projectId != "" then {projectId: $projectId} else {} end)')
+      local created
+      created=$(api POST /epics -d "$body")
+      if text_out; then
+        echo "${GRN}Added epic${R} $(echo "$created" | describe_epic)"
+      else
+        echo "$created" | jq '.'
+      fi
+      ;;
+
+    update)
+      local target="${1:-}"
+      shift || true
+      if [[ -z "$target" || "$target" == "-h" || "$target" == "--help" ]]; then
+        usage_epic
+        [[ -z "$target" ]] && exit 1 || exit 0
+      fi
+      local epic_id
+      epic_id=$(resolve_epic_id "$target")
+
+      local title="" category="" goal="" description="" status="" project_q=""
+      local has_title=false has_category=false has_goal=false has_desc=false has_status=false
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --title) title="$2"; has_title=true; shift 2 ;;
+          -p|--category|--project) category="$2"; has_category=true; shift 2 ;;
+          --project-id) project_q="$2"; shift 2 ;;
+          -g|--goal) goal="$2"; has_goal=true; shift 2 ;;
+          -d|--description) description="$2"; has_desc=true; shift 2 ;;
+          --status) status="$2"; has_status=true; shift 2 ;;
+          --completed) status="completed"; has_status=true; shift ;;
+          --active) status="active"; has_status=true; shift ;;
+          --on-hold) status="on_hold"; has_status=true; shift ;;
+          *) usage_die "Unknown option for epic update: $1" ;;
+        esac
+      done
+
+      local goal_id="" project_id=""
+      if [[ "$has_goal" == true && -n "$goal" && "$(lower "$goal")" != "none" ]]; then
+        goal_id=$(resolve_goal_id "$goal")
+      fi
+      [[ -n "$project_q" ]] && project_id=$(resolve_project "$project_q" | jq -r '.id')
+
+      local body
+      body=$(jq -n \
+        --arg title "$title" --argjson has_title "$has_title" \
+        --arg category "$category" --argjson has_cat "$has_category" \
+        --arg goalId "$goal_id" --argjson has_goal "$has_goal" \
+        --arg description "$description" --argjson has_desc "$has_desc" \
+        --arg status "$status" --argjson has_status "$has_status" \
+        --arg projectId "$project_id" \
+        '{}
+        | if $has_title then .title = $title else . end
+        | if $has_cat then .category = (if ($category == "" or $category == "null") then null else $category end) else . end
+        | if $has_goal then .goalId = (if ($goalId == "" or $goalId == "null") then null else $goalId end) else . end
+        | if $has_desc then .description = (if ($description == "" or $description == "null") then null else $description end) else . end
+        | if $has_status then .status = $status else . end
+        | if $projectId != "" then .projectId = $projectId else . end')
+      [[ "$body" == "{}" ]] && usage_die "Nothing to update. See: timdo epic --help"
+
+      local updated
+      updated=$(api PUT "/epics/$epic_id" -d "$body")
+      if text_out; then
+        echo "${GRN}Updated epic${R} $(echo "$updated" | describe_epic)"
+      else
+        echo "$updated" | jq '.'
+      fi
+      ;;
+
+    delete)
+      local target="${1:-}"
+      if [[ -z "$target" || "$target" == "-h" || "$target" == "--help" ]]; then
+        echo "Usage: timdo epic delete <id|title>"
+        [[ -z "$target" ]] && exit 1 || exit 0
+      fi
+      local epic_id epic_json result
+      epic_id=$(resolve_epic_id "$target")
+      epic_json=$( (api GET "/epics/$epic_id" 2>/dev/null) || echo '{}')
+      result=$(api DELETE "/epics/$epic_id")
+      if text_out; then
+        echo "${GRN}Deleted epic${R} $(echo "$epic_json" | jq -r '"\((.id // "")[0:8])  \"\(.title // "")\""')"
+      else
+        echo "$result" | jq '.'
+      fi
+      ;;
+
+    get)
+      local target="${1:-}"
+      if [[ -z "$target" || "$target" == "-h" || "$target" == "--help" ]]; then
+        echo "Usage: timdo epic get <id|title>"
+        [[ -z "$target" ]] && exit 1 || exit 0
+      fi
+      local epic_id epic_json tasks_raw activity
+      epic_id=$(resolve_epic_id "$target")
+      epic_json=$(api GET "/epics/$epic_id")
+      tasks_raw=$(api GET "/projects?epicId=$(urlencode "$epic_id")")
+      tasks_raw=$(echo "$tasks_raw" | jq '[.[] | select(.isDeleted != true)] | sort_by((.status | {"do":0,"awaiting":1,"delegate":2,"delay":3,"done":4}[.] // 9), -.priority)')
+      activity=$( (api GET "/activity?epicId=$(urlencode "$epic_id")&limit=8" 2>/dev/null) || echo '[]')
+
+      if ! is_text; then
+        echo "$epic_json" | jq --argjson tasks "$tasks_raw" --argjson activity "$activity" '. + {tasks: $tasks, activity: $activity}'
+        return
+      fi
+
+      echo "$epic_json" | jqt "$epic_line_lib"'
+        def row($k; $v): if ($v // "") == "" then empty else "  " + ($k | pad(15) | paint("dim")) + ($v | tostring | gsub("\n"; "\n" + (" " * 17))) end;
+        ("Epic: " + .title | paint("bold")),
+        row("ID:"; .id),
+        row("Status:"; .status),
+        row("Workspace:"; (.orgName // "") + (if .isShared == true then "  (shared, your role: \(.myRole // "?"))" else (if .orgName then "  (personal)" else "" end) end)),
+        row("Project:"; (.category // "") + (if .projectKey then " (\(.projectKey))" else "" end)),
+        row("Progress:"; "\(.progressPercentage // 0)%  \(.doneTasks // 0)/\(.totalTasks // 0) tasks done"),
+        row("Created by:"; ((.createdByName // "") + "  " + (.createdAt | long_dt)) | sub("^ +"; "")),
+        row("Last updated:"; ((.updatedByName // "") + "  " + (.updatedAt | long_dt)) | sub("^ +"; "")),
+        row("Access:"; if .canEdit == false then "view only" else "can edit" end),
+        row("Description:"; .description)'
+      echo ""
+      echo "${B}Tasks ($(echo "$tasks_raw" | jq 'length'))${R}"
+      if [[ "$(echo "$tasks_raw" | jq 'length')" -eq 0 ]]; then
+        echo "  (no tasks in this epic yet)"
+      else
+        echo "$tasks_raw" | jqt '
+          task_widths as $w
+          | .[]
+          | (if .status == "done" then "x" else " " end) as $x
+          | "  [\($x)] " + (.status | pad(8)) + (task_line($w) | sub("^  "; ""))'
+      fi
+      if [[ "$(echo "$activity" | jq 'length')" -gt 0 ]]; then
+        echo ""
+        echo "${B}Recent activity${R}"
+        echo "$activity" | jqt 'activity_lines'
+      fi
+      ;;
+
+    *)
+      usage_die "Unknown epic subcommand: $subcmd. Use list, get, add, update or delete (see: timdo epic --help)."
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# goals (personal, never shared)
+# ---------------------------------------------------------------------------
+cmd_goal() {
+  local subcmd="${1:-list}"
+  shift || true
+
+  case "$subcmd" in
+    -h|--help|help)
+      echo "Usage: timdo goal list [-t aims|focuses|values|housekeeping]"
+      echo "  Life goals are private to you. Collaborators never see them."
+      ;;
+    list)
+      local type=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          -t|--type) type="$2"; shift 2 ;;
+          *) usage_die "Unknown option for goal list: $1" ;;
+        esac
+      done
+      local path="/goals"
+      [[ -n "$type" ]] && path="$path?type=$(urlencode "$type")"
+      local raw
+      raw=$(api GET "$path")
+      if ! is_text; then
+        echo "$raw" | jq '.'
+        return
+      fi
+      if [[ "$(echo "$raw" | jq 'length')" -eq 0 ]]; then
+        echo "No goals found."
+        return
+      fi
+      echo "$raw" | jqt 'group_by(.type) | .[] | ("", ((.[0].type // "other") | ascii_upcase | paint("bold"))),
+        (.[] | "  " + ((.id // "")[0:8] | paint("dim")) + "  " + .title + (if .description then ("  - " + (.description | oneline) | paint("dim")) else "" end))'
+      ;;
+    *)
+      usage_die "Unknown goal subcommand: $subcmd. Use 'timdo goal list'."
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# poster (personal: your own tasks across all workspaces)
+# ---------------------------------------------------------------------------
+cmd_poster() {
+  local output="" category="" poster_type=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output|-o) output="$2"; shift 2 ;;
+      --category|-c|-p) category="$2"; shift 2 ;;
+      --type|-t) poster_type="$2"; shift 2 ;;
+      -h|--help|help)
+        echo "Usage: timdo poster --output <path> [-c|--category <list>] [--type <done|active|goals>]"
+        echo "  Downloads a poster SVG. Posters show your own tasks (assigned to you) across all workspaces."
+        exit 0
+        ;;
+      *) usage_die "Unknown option for poster: $1" ;;
+    esac
+  done
+  [[ -z "$output" ]] && usage_die "Usage: timdo poster --output <path> [-c|--category <list>] [--type <done|active|goals>]"
+
+  # Without --type: the Wall of Done when a category is given, otherwise the goals poster
+  if [[ -z "$poster_type" ]]; then
+    if [[ -n "$category" ]]; then poster_type="done"; else poster_type="goals"; fi
+  fi
+
+  local endpoint_path=""
+  case "$poster_type" in
+    done) endpoint_path="/poster/wall-of-done" ;;
+    active) endpoint_path="/poster/active" ;;
+    goals) endpoint_path="/goals/poster.svg" ;;
+    *) usage_die "Unknown poster type: $poster_type. Supported types: done, active, goals" ;;
+  esac
+  if [[ -n "$category" && "$poster_type" != "goals" ]]; then
+    endpoint_path="${endpoint_path}?categories=$(echo "$category" | tr ' ' '+')"
+  fi
+
+  local parent_dir
+  parent_dir=$(dirname "$output")
+  [[ -n "$parent_dir" && ! -d "$parent_dir" ]] && mkdir -p "$parent_dir"
+
+  api GET "$endpoint_path" > "$output"
+  echo "Downloaded $poster_type poster SVG to $output"
+}
+
+# ---------------------------------------------------------------------------
+# search, merge, audit, customers, link, unlink
+# ---------------------------------------------------------------------------
+cmd_search() {
+  local query="" include_done=false customer=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        echo "Usage: timdo search \"query\" [--all] [--customer \"...\"]"
+        echo "  Full-text search across every workspace you can see. --all includes done tasks."
+        exit 0 ;;
+      --all|-a) include_done=true; shift ;;
+      --customer) customer="$2"; shift 2 ;;
+      *) if [[ -z "$query" ]]; then query="$1"; else query="$query $1"; fi; shift ;;
+    esac
+  done
+  [[ -z "$query" ]] && usage_die "Usage: timdo search \"query\" [--all] [--customer \"...\"]"
+
+  local endpoint="/tasks/search?q=$(urlencode "$query")&includeDone=${include_done}"
+  [[ -n "$customer" ]] && endpoint="${endpoint}&customer=$(urlencode "$customer")"
+
+  local raw tasks enriched
+  raw=$(api GET "$endpoint")
+  tasks=$(api_optional /projects)
+  # Search results carry no sharing fields yet, so add them from the task list
+  echo "$raw" > "$TMPD/search.json"; echo "$tasks" > "$TMPD/tasks.json"
+  enriched=$(jq -n --slurpfile rs "$TMPD/search.json" --slurpfile ts "$TMPD/tasks.json" '
+    $rs[0] as $r | $ts[0] as $t
+    | ($t | map({key: .id, value: .}) | from_entries) as $byId
+    | $r | map(. as $s | ($byId[$s.id] // {}) as $v
+        | $s + ($v | {category, projectId, projectKey, projectName, orgId, orgName, isShared, myRole, canEdit,
+                      assigneeId, assigneeName, reporterName, updatedByName, isMine}
+                   | with_entries(select(.value != null))))')
+
+  if ! is_text; then
+    echo "$enriched" | jq '.'
+    return
+  fi
+
+  local count
+  count=$(echo "$enriched" | jq 'length')
+  if [[ "$count" -eq 0 ]]; then
+    echo "No matching tasks found for: $query"
+    return
+  fi
+  echo "${B}Found $count matching tasks${R}"
+  echo "$enriched" | jqt '.[]
+    | "  " + (.shortId | paint("dim")) + "  " + ("(\(.status), P\(.priority))" | pad(15)) + "  " + .title
+      + (if (where) != "" then "  " + (where | paint("cyan")) else "" end)
+      + (if .isShared == true then "  " + (who | paint("yellow")) else "" end)
+      + (if .customer then "  " + ("customer: \(.customer)" | paint("dim")) else "" end)
+      + (if .snippet then "\n             " + ("Match: " + (.snippet | gsub("<[^>]*>"; "") | oneline) | paint("dim")) else "" end)
+      + (if (.linkedTasks // []) | length > 0 then "\n             Linked: " + ([.linkedTasks[] | "[\(.relationType)] \(.title) (\(.shortId))"] | join(", ")) else "" end)'
+}
+
+cmd_merge() {
+  local source_arg="" target_arg="" assume_yes=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes) assume_yes=true; shift ;;
+      -h|--help) source_arg=""; target_arg=""; break ;;
+      *)
+        if [[ -z "$source_arg" ]]; then source_arg="$1"
+        elif [[ -z "$target_arg" ]]; then target_arg="$1"
+        else usage_die "Unexpected argument: $1"; fi
+        shift ;;
+    esac
+  done
+
+  if [[ -z "$source_arg" || -z "$target_arg" ]]; then
+    echo "Usage: timdo merge <source_id> <target_id> [--yes|-y]" >&2
+    echo "  Merges source task into target task (target survives, source is archived)." >&2
+    echo "  You need edit rights on both tasks." >&2
+    exit 1
+  fi
+
+  local source_json target_json
+  source_json=$(resolve_task "$source_arg")
+  target_json=$(resolve_task "$target_arg")
+  local source_id target_id source_title target_title
+  source_id=$(echo "$source_json" | jq -r '.id')
+  target_id=$(echo "$target_json" | jq -r '.id')
+  source_title=$(echo "$source_json" | jq -r '.project')
+  target_title=$(echo "$target_json" | jq -r '.project')
+
+  [[ "$source_id" == "$target_id" ]] && die "Error: Cannot merge a task into itself."
+
+  if [[ "$assume_yes" != "true" && "$TIMDO_FORMAT" != "json" ]]; then
+    echo ""
+    echo "${B}Confirm task merge${R}"
+    echo "  ABSORBING (source): $(echo "$source_json" | describe_task)  -> will be archived"
+    echo "  KEEPING   (target): $(echo "$target_json" | describe_task)  -> absorbs notes and updates"
+    echo ""
+    confirm_or_exit "Proceed with merge?" false
+  fi
+
+  local result
+  result=$(api POST "/projects/$target_id/merge" -d "$(jq -n --arg s "$source_id" '{sourceId: $s}')")
+  if ! is_text; then
+    echo "$result" | jq '.'
+  else
+    echo "Successfully merged '${source_title}' into '${target_title}' (${target_id:0:8})."
+  fi
+}
+
+cmd_audit() {
+  local scope="mine"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) scope="all"; shift ;;
+      --mine) scope="mine"; shift ;;
+      -h|--help)
+        cat <<'EOF'
+Usage: timdo audit [--all]
+
+Hygiene check on active (not done) tasks: missing epic, life goal, project or reason,
+plus active epics with no tasks.
+
+Scope: by default only YOUR tasks (assigned to you, or unassigned and created by you)
+that you can edit, and epics you created. Collaborators' tasks are theirs to tidy, and
+life goal links are private, so their "missing goal" count would mean nothing to you.
+--all widens it to every task and epic you can edit in every workspace.
+EOF
+        exit 0 ;;
+      *) usage_die "Unknown option for audit: $1" ;;
+    esac
+  done
+
+  local raw epics_raw me
+  raw=$(all_tasks)
+  epics_raw=$(api_cached /epics)
+  me=$(api_optional /users/me '{}' | jq -r '.id // ""')
+
+  local report
+  echo "$raw" > "$TMPD/tasks.json"; echo "$epics_raw" > "$TMPD/epics.json"
+  report=$(jq -n --slurpfile ts "$TMPD/tasks.json" --slurpfile es "$TMPD/epics.json" --arg scope "$scope" --arg me "$me" '
+    def blank: . == null or . == "";
+    $ts[0] as $t | $es[0] as $e |
+    [$t[] | select(.isDeleted != true and .status != "done")
+          | select(.canEdit != false)
+          | select($scope == "all" or .isMine == true or (.isMine == null))] as $active
+    | [$e[] | select(.status == "active" and (.totalTasks // 0) == 0)
+            | select(.canEdit != false)
+            | select($scope == "all" or (.createdById // null) == null or .createdById == $me)] as $emptyEpics
+    | {
+        scope: $scope,
+        totalActiveTasks: ($active | length),
+        missingEpic: ([$active[] | select(.epicId | blank)] | length),
+        missingGoal: ([$active[] | select(.goalId | blank)] | length),
+        missingCategory: ([$active[] | select(.category | blank)] | length),
+        missingReason: ([$active[] | select(.reason | blank)] | length),
+        activeEpicsWithNoTasks: ($emptyEpics | length),
+        emptyEpics: [$emptyEpics[] | {id, title, category, orgName}],
+        byWorkspace: ($active | group_by(.orgName // "") | map({workspace: (.[0].orgName // "unknown"), activeTasks: length,
+                       missingEpic: ([.[] | select(.epicId | blank)] | length)}))
+      }')
+
+  if ! is_text; then
+    echo "$report"
+    return
+  fi
+
+  local mine_flag="--mine "
+  [[ "$scope" == "all" ]] && mine_flag=""
+  echo "$report" | jqt '
+    ("TimDo alignment and hygiene audit" | paint("bold")),
+    ("Scope: " + (if .scope == "all" then "every task and epic you can edit" else "your own tasks and epics (use --all for everything you can edit)" end) | paint("dim")),
+    "",
+    "  Active tasks:              \(.totalActiveTasks | lpad(4))",
+    "  Missing epic:              \(.missingEpic | lpad(4))  " + ("view: timdo list \($f)--no-epic" | paint("dim")),
+    "  Missing life goal:         \(.missingGoal | lpad(4))  " + ("view: timdo list \($f)--no-goal" | paint("dim")),
+    "  Missing project:           \(.missingCategory | lpad(4))  " + ("view: timdo list \($f)--no-category" | paint("dim")),
+    "  Missing why/reason:        \(.missingReason | lpad(4))",
+    "  Active epics with 0 tasks: \(.activeEpicsWithNoTasks | lpad(4))",
+    (.emptyEpics[] | "      " + (.id[0:8] | paint("dim")) + "  " + .title + "  " + ((if .orgName then "\(.orgName)/" else "" end) + (.category // "") | paint("cyan"))),
+    (if (.byWorkspace | length) > 1 then "", "  By workspace:", (.byWorkspace[] | "    " + (.workspace | pad(24)) + "\(.activeTasks) active, \(.missingEpic) without an epic") else empty end),
+    "",
+    "To link an orphan task:",
+    "  timdo update <id> -e <epic> [-g <goal>] [-p <project>]"
+  ' --arg f "$mine_flag"
+}
+
+cmd_customers() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    echo "Usage: timdo customers   Customers with open task counts, and the workspaces they appear in"
+    exit 0
+  fi
+  local raw tasks enriched
+  raw=$(api GET /customers)
+  tasks=$(api_optional /projects)
+  echo "$raw" > "$TMPD/customers.json"; echo "$tasks" > "$TMPD/tasks.json"
+  enriched=$(jq -n --slurpfile rs "$TMPD/customers.json" --slurpfile ts "$TMPD/tasks.json" '
+    $rs[0] as $r | $ts[0] as $t
+    | $r | map(. as $c
+      | ($c.customer | ascii_downcase | gsub("^\\s+|\\s+$"; "")) as $k
+      | $c + {workspaces: ([$t[] | select(.isDeleted != true and ((.customer // "") | ascii_downcase | gsub("^\\s+|\\s+$"; "")) == $k) | .orgName // empty] | unique)})')
+
+  if ! is_text; then
+    echo "$enriched" | jq '.'
+    return
+  fi
+  local count
+  count=$(echo "$enriched" | jq 'length')
+  if [[ "$count" -eq 0 ]]; then
+    echo "No customers found."
+    return
+  fi
+  echo "${B}Customers ($count)${R}"
+  echo "$enriched" | jqt 'maxlen(.customer) as $w | .[]
+    | "  " + (.customer | pad($w)) + "  " + ("\(.openCount) open" | lpad(8)) + "  " + (.workspaces | join(", ") | paint("cyan"))'
+}
+
+cmd_link() {
+  local source_id="${1:-}" target_id="${2:-}"
+  if [[ "$source_id" == "-h" || "$source_id" == "--help" ]]; then source_id=""; fi
+  shift 2 || true
+  local relation_type="relates_to" reason=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type|-t) relation_type="$2"; shift 2 ;;
+      --reason|-r) reason="$2"; shift 2 ;;
+      *) usage_die "Unknown option for link: $1" ;;
+    esac
+  done
+  if [[ -z "$source_id" || -z "$target_id" ]]; then
+    usage_die "Usage: timdo link <task_id> <target_task_id> [--type relates_to|blocks|blocked_by|duplicates] [--reason \"...\"]"
+  fi
+
+  local source_json target_json
+  source_json=$(resolve_task "$source_id")
+  target_json=$(resolve_task "$target_id")
+  local body result
+  body=$(jq -n --arg t "$(echo "$target_json" | jq -r '.id')" --arg relation "$relation_type" --arg reason "$reason" \
+    '{targetTaskId: $t, relation: $relation, reason: (if $reason == "" then null else $reason end)}')
+  result=$(api POST "/tasks/$(echo "$source_json" | jq -r '.id')/links" -d "$body")
+  if ! is_text; then
+    echo "$result" | jq '.'
+  else
+    echo "Linked task $source_id to $target_id ($relation_type): \"$(echo "$source_json" | jq -r '.project')\" $relation_type \"$(echo "$target_json" | jq -r '.project')\"."
+  fi
+}
+
+cmd_unlink() {
+  local source_id="${1:-}" target_id="${2:-}"
+  if [[ -z "$source_id" || -z "$target_id" || "$source_id" == "-h" || "$source_id" == "--help" ]]; then
+    usage_die "Usage: timdo unlink <task_id> <target_task_id>"
+  fi
+  local result
+  result=$(api DELETE "/tasks/$source_id/links/$target_id")
+  if ! is_text; then
+    echo "$result" | jq '.'
+  else
+    echo "Unlinked task $source_id and $target_id."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# activity
+# ---------------------------------------------------------------------------
+usage_activity() {
+  cat <<'EOF'
+Usage: timdo activity [--task <id>] [--epic <id|title>] [--project <name|KEY>] [--workspace <name>] [-n N]
+
+Who did what, newest first, across everything you can see (default 20 entries).
+  08 Oct 14:02  Robin Fairweather  Moved "Fix inverter" from Do to Done  [Solfit]
+EOF
+}
+
+cmd_activity() {
+  local task="" epic="" project="" workspace="" limit=20
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage_activity; exit 0 ;;
+      --task|-t) task="$2"; shift 2 ;;
+      --epic|-e) epic="$2"; shift 2 ;;
+      --project|-p|--project-id) project="$2"; shift 2 ;;
+      --workspace|-w) workspace="$2"; shift 2 ;;
+      -n|--limit) limit="$2"; shift 2 ;;
+      *) usage_die "Unknown option for activity: $1 (see: timdo activity --help)" ;;
+    esac
+  done
+  [[ "$limit" =~ ^[0-9]+$ ]] || die "Error: -n must be a number."
+
+  local params=("limit=$limit")
+  [[ -n "$task" ]] && params+=("taskId=$(urlencode "$(resolve_task_id "$task")")")
+  [[ -n "$epic" ]] && params+=("epicId=$(urlencode "$(resolve_epic_id "$epic")")")
+  [[ -n "$project" ]] && params+=("projectId=$(urlencode "$(resolve_project "$project" | jq -r '.id')")")
+  [[ -n "$workspace" ]] && params+=("orgId=$(urlencode "$(resolve_org "$workspace" | jq -r '.id')")")
+
+  local raw
+  raw=$(api GET "/activity?$(IFS='&'; echo "${params[*]}")")
+  if ! is_text; then
+    echo "$raw" | jq '.'
+    return
+  fi
+  if [[ "$(echo "$raw" | jq 'length')" -eq 0 ]]; then
+    echo "No activity yet."
+    return
+  fi
+  echo "$raw" | jqt 'activity_lines | sub("^  "; "")'
+}
+
+# ---------------------------------------------------------------------------
+# whoami
+# ---------------------------------------------------------------------------
+cmd_whoami() {
+  local me
+  me=$(api GET /users/me)
+  if ! is_text; then
+    echo "$me" | jq --arg as "$TIMDO_AS" --arg api "$TIMDO_API" '. + {actingAs: (if $as == "" then null else $as end), api: $api}'
+    return
+  fi
+  echo "$me" | jqt '(.name // .email | paint("bold")) + " <\(.email)>" + ("  id " + .id | paint("dim"))'
+  if [[ -n "$TIMDO_AS" ]]; then
+    echo "  Acting as $TIMDO_AS (X-Timdo-User), via the internal secret."
+  fi
+  echo "  API: $TIMDO_API"
+  local orgs
+  orgs=$( (api GET /organisations 2>/dev/null) || echo '[]')
+  echo "$orgs" | jqt 'if length > 0 then "  Workspaces: " + ([.[] | "\(.name) (\(.role)\(if .isPersonal then ", personal" elif (.memberCount // 1) > 1 then ", \(.memberCount) members" else "" end))"] | join("; ")) else empty end'
+}
+
+# ---------------------------------------------------------------------------
+# workspaces and sharing
+# ---------------------------------------------------------------------------
+usage_workspace() {
+  cat <<'EOF'
+Usage: timdo workspace <subcommand> ...      (aliases: ws, org)
+
+A workspace holds projects; everyone in it sees every project, epic, task, note
+and activity entry inside. Roles: owner (everything), admin (members, viewers,
+projects), member (works on tasks, epics, notes), viewer (read-only).
+Life goals stay private to each person.
+
+  list                                   Your workspaces, your role, members and projects
+  show <workspace>                       Members and roles, projects with counts, pending invites
+  members <workspace>                    Just the members
+  create <name>                          New shared workspace (you are owner)
+  rename <workspace> <new name>
+  share <workspace> <email> [--role member|viewer|admin]
+                                         Add someone, or invite them if they have no account yet
+  role <workspace> <email|name> <owner|admin|member|viewer>
+  remove <workspace> <email|name> [--yes]
+  revoke <workspace> <email>             Cancel a pending invite
+  leave <workspace> [--yes]
+  add-project <workspace> <name> [-d "description"]
+  move-project <project> <workspace> --yes
+                                         Move a project, its epics and tasks (history kept).
+                                         Needs owner/admin on the source and edit rights on the target.
+  accept <token>                         Accept an invite token
+
+<workspace> is a name, "personal", an id or id prefix. <project> is a name,
+a key such as SOL, or "Workspace/Project".
+
+Examples:
+  timdo ws list
+  timdo ws show "Migrating Dragons"
+  timdo ws share "Migrating Dragons" robin@example.com --role viewer
+  timdo ws move-project Solfit "Migrating Dragons" --yes
+EOF
+}
+
+print_share_result() {
+  local res="$1" ws_name="$2"
+  if ! is_text; then
+    echo "$res" | jq --arg app "$APP_URL" 'if .status == "invited" and .token then . + {inviteUrl: "\($app)/invite/\(.token)"} else . end'
+    return
+  fi
+  echo "$res" | jqt '
+    if .status == "added" then "\(c("green"))Added\(c("reset")) \(.name // .email) <\(.email)> to \"\($ws)\" as \(.role). They can see it now."
+    elif .status == "already_member" then "\(.name // .email // $email) is already a member of \"\($ws)\"\(if .role then " (" + .role + ")" else "" end). Nothing changed."
+    elif .status == "invited" then
+      "\(c("green"))Invited\(c("reset")) \(.email) to \"\($ws)\" as \(.role). They join automatically when they first sign in with that email.",
+      "  Invite link: \($app)/invite/\(.token)",
+      (if .expiresAt then "  Expires: \(.expiresAt | day)" else empty end)
+    elif .success == true then "Invitation sent to \(.email // $email) for \"\($ws)\" with role \(.role // "member")."
+    else tostring end' --arg ws "$ws_name" --arg app "$APP_URL" --arg email "${3:-}"
+}
+
+cmd_workspace() {
+  local subcmd="${1:-list}"
+  shift || true
+
+  case "$subcmd" in
+    -h|--help|help) usage_workspace ;;
+
+    list|ls)
+      local raw
+      raw=$(api GET /organisations)
+      if ! is_text; then
+        echo "$raw" | jq '.'
+        return
+      fi
+      if [[ "$(echo "$raw" | jq 'length')" -eq 0 ]]; then
+        echo "No workspaces."
+        return
+      fi
+      echo "$raw" | jqt '
+        (maxlen(.name) | [., 9] | max) as $w
+        | ("  " + ("WORKSPACE" | pad($w)) + "  ROLE    MEMBERS  PROJECTS  TYPE" | paint("dim")),
+          (.[] | "  " + (.name | pad($w) | paint("bold"))
+            + "  " + ((.role // "member") | pad(6))
+            + "  " + ("\(.memberCount // "?")" | lpad(7))
+            + "  " + ("\(.projectCount // "?")" | lpad(8))
+            + "  " + (if .isPersonal == true then ("personal" | pad(8) | paint("dim")) elif (.memberCount // 1) > 1 then ("shared" | pad(8) | paint("cyan")) else ("private" | pad(8)) end)
+            + ("  id " + (.id // "") | paint("dim")))'
+      ;;
+
+    show|get|info)
+      local q="${1:-}"
+      [[ -z "$q" ]] && usage_die "Usage: timdo workspace show <workspace>"
+      local org
+      org=$(resolve_org "$q")
+      if ! is_text; then
+        echo "$org" | jq '.'
+        return
+      fi
+      echo "$org" | jqt '
+        (.name | paint("bold")) + "  " + ("id \(.id)" | paint("dim")),
+        "  Your role: \(.role // "?")" + (if .isPersonal == true then "   (personal workspace)" else "" end),
+        "",
+        ("Members (\(.members | length))" | paint("bold")),
+        ((.members | maxlen(.userName // .name // "")) as $nw | (.members | maxlen(.userEmail // .email // "")) as $ew
+          | .members | sort_by(({"owner":0,"admin":1,"member":2,"viewer":3}[.role] // 9), (.userName // "")) | .[]
+          | .role as $role
+          | "  " + ((.userName // .name // "") | pad($nw)) + "  " + ((.userEmail // .email // "") | pad($ew) | paint("dim"))
+            + "  " + ($role | pad(6) | paint(if $role == "viewer" then "yellow" else "green" end)) + (if .isMe == true then "  (you)" else "" end)),
+        "",
+        ("Projects (\(.projects | length))" | paint("bold")),
+        (if (.projects | length) == 0 then "  (none)" else
+          ((.projects | maxlen(.name)) as $pw
+           | .projects[] | "  " + ((.key // "") | pad(4) | paint("cyan")) + "  " + (.name | pad($pw))
+             + "  " + ("\(.openTasks // 0) open" | lpad(8)) + "  " + ("\(.doneTasks // 0) done" | lpad(8))
+             + "  " + ("\(.epicCount // 0) epics" | lpad(8)) + (if .isArchived == true then "  archived" else "" end))
+         end),
+        (if ((.invites // []) | length) > 0 then
+          "", ("Pending invites (\(.invites | length))" | paint("bold")),
+          ((.invites | maxlen(.email)) as $iw | .invites[] | "  " + (.email | pad($iw)) + "  " + (.role | pad(6)) + "  expires \(.expiresAt | day)  " + ("\($app)/invite/\(.token)" | paint("dim")))
+         else empty end)
+      ' --arg app "$APP_URL"
+      ;;
+
+    members)
+      local q="${1:-}"
+      [[ -z "$q" ]] && usage_die "Usage: timdo workspace members <workspace>"
+      local org org_id raw
+      org=$( (resolve_org "$q") 2>/dev/null || true)
+      if [[ -n "$org" ]]; then
+        org_id=$(echo "$org" | jq -r '.id')
+      else
+        # Fall back to the plain workspace list (older APIs have no /organisations/sharing)
+        org_id=$(api GET /organisations | jq -r --arg q "$q" '[.[] | select(.id == $q or (.id | startswith($q)) or ((.name // "") | ascii_downcase) == ($q | ascii_downcase))][0].id // empty')
+        [[ -z "$org_id" ]] && org_id="$q"
+      fi
+      raw=$(api GET "/organisations/$org_id/members")
+      if ! is_text; then
+        echo "$raw" | jq '.'
+        return
+      fi
+      echo "$raw" | jqt '(maxlen(.userName // .name // "")) as $nw | (maxlen(.userEmail // .email // "")) as $ew | .[]
+        | "  " + ((.userName // .name // "") | pad($nw)) + "  " + ("<\(.userEmail // .email // "")>" | pad($ew + 2)) + "  " + (.role // "member")'
+      ;;
+
+    create|new)
+      local name="${1:-}"
+      [[ -z "$name" ]] && usage_die "Usage: timdo workspace create <name>"
+      local res
+      res=$(api POST /organisations -d "$(jq -n --arg n "$name" '{name: $n}')")
+      if ! is_text; then echo "$res" | jq '.'; return; fi
+      echo "${GRN}Created${R} workspace \"$(echo "$res" | jq -r '.name')\" ($(echo "$res" | jq -r '.id[0:8]')). You are the owner."
+      echo "  Next: timdo ws add-project \"$name\" <project>   or   timdo ws move-project <project> \"$name\" --yes"
+      echo "        timdo ws share \"$name\" <email>"
+      ;;
+
+    rename)
+      local q="${1:-}" new_name="${2:-}"
+      [[ -z "$q" || -z "$new_name" ]] && usage_die "Usage: timdo workspace rename <workspace> <new name>"
+      local org_id res
+      org_id=$(resolve_org "$q" | jq -r '.id')
+      res=$(api PUT "/organisations/$org_id" -d "$(jq -n --arg n "$new_name" '{name: $n}')")
+      if ! is_text; then echo "$res" | jq '.'; return; fi
+      echo "${GRN}Renamed${R} workspace to \"$new_name\"."
+      ;;
+
+    share|invite)
+      local q="${1:-}" email="${2:-}" role="member"
+      shift 2 || true
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --role|-r) role="$2"; shift 2 ;;
+          *) usage_die "Unknown option for workspace share: $1" ;;
+        esac
+      done
+      [[ -z "$q" || -z "$email" ]] && usage_die "Usage: timdo workspace share <workspace> <email> [--role member|viewer|admin]"
+      case "$role" in admin|member|viewer) ;; *) usage_die "Error: --role must be admin, member or viewer (owners are set with: timdo ws role)." ;; esac
+      local org org_id ws_name
+      org=$( (resolve_org "$q") 2>/dev/null || true)
+      if [[ -n "$org" ]]; then
+        org_id=$(echo "$org" | jq -r '.id'); ws_name=$(echo "$org" | jq -r '.name')
+      else
+        org_id=$(api GET /organisations | jq -r --arg q "$q" '[.[] | select(.id == $q or (.id | startswith($q)) or ((.name // "") | ascii_downcase) == ($q | ascii_downcase))][0].id // empty')
+        [[ -z "$org_id" ]] && die "Not found: no workspace called \"$q\"."
+        ws_name="$q"
+      fi
+      local res
+      res=$(api POST "/organisations/$org_id/invites" -d "$(jq -n --arg e "$email" --arg r "$role" '{email: $e, role: $r}')")
+      print_share_result "$res" "$ws_name" "$email"
+      ;;
+
+    role)
+      local q="${1:-}" who="${2:-}" role="${3:-}"
+      [[ -z "$q" || -z "$who" || -z "$role" ]] && usage_die "Usage: timdo workspace role <workspace> <email|name> <owner|admin|member|viewer>"
+      case "$role" in owner|admin|member|viewer) ;; *) usage_die "Error: role must be owner, admin, member or viewer." ;; esac
+      local org member user_id res
+      org=$(resolve_org "$q")
+      member=$(resolve_member "$org" "$who")
+      user_id=$(echo "$member" | jq -r '.userId')
+      res=$(api PUT "/organisations/$(echo "$org" | jq -r '.id')/members/$(urlencode "$user_id")" -d "$(jq -n --arg r "$role" '{role: $r}')")
+      if ! is_text; then echo "$res" | jq '.'; return; fi
+      echo "${GRN}Updated${R} $(echo "$member" | jq -r '.userName // .userEmail') in \"$(echo "$org" | jq -r '.name')\": $(echo "$member" | jq -r '.role') -> $role."
+      ;;
+
+    remove|kick)
+      local q="${1:-}" who="${2:-}" yes=false
+      shift 2 || true
+      while [[ $# -gt 0 ]]; do
+        case "$1" in -y|--yes) yes=true; shift ;; *) usage_die "Unknown option for workspace remove: $1" ;; esac
+      done
+      [[ -z "$q" || -z "$who" ]] && usage_die "Usage: timdo workspace remove <workspace> <email|name> [--yes]"
+      local org member org_name member_name
+      org=$(resolve_org "$q")
+      member=$(resolve_member "$org" "$who")
+      org_name=$(echo "$org" | jq -r '.name'); member_name=$(echo "$member" | jq -r '.userName // .userEmail')
+      [[ "$(echo "$member" | jq -r '.isMe')" == "true" ]] && die "Error: that is you. Use: timdo workspace leave \"$org_name\""
+      confirm_or_exit "Remove $member_name from \"$org_name\"? They will lose access to its projects." "$yes"
+      local res
+      res=$(api DELETE "/organisations/$(echo "$org" | jq -r '.id')/members/$(urlencode "$(echo "$member" | jq -r '.userId')")")
+      if ! is_text; then echo "$res" | jq '.'; return; fi
+      echo "${GRN}Removed${R} $member_name from \"$org_name\". Tasks assigned to them stay put; reassign them if needed."
+      ;;
+
+    leave)
+      local q="${1:-}" yes=false
+      shift || true
+      while [[ $# -gt 0 ]]; do
+        case "$1" in -y|--yes) yes=true; shift ;; *) usage_die "Unknown option for workspace leave: $1" ;; esac
+      done
+      [[ -z "$q" ]] && usage_die "Usage: timdo workspace leave <workspace> [--yes]"
+      local org org_name me
+      org=$(resolve_org "$q")
+      org_name=$(echo "$org" | jq -r '.name')
+      [[ "$(echo "$org" | jq -r '.isPersonal')" == "true" ]] && die "Error: you cannot leave your personal workspace."
+      me=$(my_id)
+      confirm_or_exit "Leave \"$org_name\"? You will lose access to its projects." "$yes"
+      local res
+      res=$(api DELETE "/organisations/$(echo "$org" | jq -r '.id')/members/$(urlencode "$me")")
+      if ! is_text; then echo "$res" | jq '.'; return; fi
+      echo "${GRN}Left${R} \"$org_name\"."
+      ;;
+
+    revoke)
+      local q="${1:-}" email="${2:-}"
+      [[ -z "$q" || -z "$email" ]] && usage_die "Usage: timdo workspace revoke <workspace> <email>"
+      local org invite
+      org=$(resolve_org "$q")
+      invite=$(echo "$org" | jq --arg e "$(lower "$email")" '[(.invites // [])[] | select((.email // "") | ascii_downcase == $e)][0] // empty')
+      [[ -z "$invite" ]] && die "Not found: no pending invite for $email in \"$(echo "$org" | jq -r '.name')\"."
+      local res
+      res=$(api DELETE "/organisations/$(echo "$org" | jq -r '.id')/invites/$(echo "$invite" | jq -r '.id')")
+      if ! is_text; then echo "$res" | jq '.'; return; fi
+      echo "${GRN}Revoked${R} the invite for $email to \"$(echo "$org" | jq -r '.name')\"."
+      ;;
+
+    add-project)
+      local q="${1:-}" name="${2:-}" description=""
+      shift 2 || true
+      while [[ $# -gt 0 ]]; do
+        case "$1" in -d|--description) description="$2"; shift 2 ;; *) usage_die "Unknown option for workspace add-project: $1" ;; esac
+      done
+      [[ -z "$q" || -z "$name" ]] && usage_die "Usage: timdo workspace add-project <workspace> <name> [-d \"description\"]"
+      local org res
+      org=$(resolve_org "$q")
+      res=$(api POST "/organisations/$(echo "$org" | jq -r '.id')/projects" \
+        -d "$(jq -n --arg n "$name" --arg d "$description" '{name: $n} + (if $d == "" then {} else {description: $d} end)')")
+      if ! is_text; then echo "$res" | jq '.'; return; fi
+      echo "${GRN}Added${R} project \"$name\"$(echo "$res" | jq -r 'if .key then " (\(.key))" else "" end') to \"$(echo "$org" | jq -r '.name')\"."
+      ;;
+
+    move-project)
+      local pq="${1:-}" q="${2:-}" yes=false
+      shift 2 || true
+      while [[ $# -gt 0 ]]; do
+        case "$1" in -y|--yes) yes=true; shift ;; *) usage_die "Unknown option for workspace move-project: $1" ;; esac
+      done
+      [[ -z "$pq" || -z "$q" ]] && usage_die "Usage: timdo workspace move-project <project> <workspace> --yes"
+      local proj dest proj_name src_name dest_name
+      proj=$(resolve_project "$pq")
+      dest=$(resolve_org "$q")
+      proj_name=$(echo "$proj" | jq -r '.name'); src_name=$(echo "$proj" | jq -r '.orgName'); dest_name=$(echo "$dest" | jq -r '.name')
+      if [[ "$(echo "$proj" | jq -r '.orgId')" == "$(echo "$dest" | jq -r '.id')" ]]; then
+        die "Error: \"$proj_name\" is already in \"$dest_name\"."
+      fi
+      local dest_members
+      dest_members=$(echo "$dest" | jq -r '[.members[] | .userName // .userEmail] | join(", ")')
+      if [[ "$yes" != true ]]; then
+        echo "Move project \"$proj_name\" ($(echo "$proj" | jq -r '.openTasks // 0') open, $(echo "$proj" | jq -r '.doneTasks // 0') done, $(echo "$proj" | jq -r '.epicCount // 0') epics)"
+        echo "  from \"$src_name\" to \"$dest_name\"."
+        echo "  Afterwards these people can see it: $dest_members"
+      fi
+      confirm_or_exit "Move it?" "$yes"
+      local res
+      res=$(api PUT "/organisations/$(echo "$proj" | jq -r '.orgId')/projects/$(echo "$proj" | jq -r '.id')" \
+        -d "$(jq -n --arg o "$(echo "$dest" | jq -r '.id')" '{orgId: $o}')")
+      if ! is_text; then echo "$res" | jq '.'; return; fi
+      echo "${GRN}Moved${R} \"$proj_name\" from \"$src_name\" to \"$dest_name\". Visible to: $dest_members"
+      ;;
+
+    accept)
+      local token="${1:-}"
+      [[ -z "$token" ]] && usage_die "Usage: timdo workspace accept <token>"
+      token="${token##*/invite/}"
+      local res
+      res=$(api POST /organisations/invites/accept -d "$(jq -n --arg t "$token" '{token: $t}')")
+      if ! is_text; then echo "$res" | jq '.'; return; fi
+      echo "${GRN}Joined${R} $(echo "$res" | jq -r '.name // .orgName // "the workspace"')."
+      ;;
+
+    *)
+      usage_die "Unknown workspace subcommand: $subcmd (see: timdo workspace --help)"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# help
+# ---------------------------------------------------------------------------
+cmd_help() {
+  cat <<'HELP'
+timdo: command line client for TimDo (tasks, epics, life goals, shared workspaces)
+
+Structure: workspace -> project -> epic -> task. Everyone in a workspace sees all of
+its projects, epics, tasks, notes and activity. Roles: owner, admin, member, viewer
+(read-only). Life goals are private to each person. New tasks are assigned to you.
+
+GLOBAL FLAGS (anywhere on the line):
+  --json                       JSON output (raw API objects, plus extra fields noted below)
+  --text                       Human-readable output. Write commands print JSON when piped
+                               unless --text is given, so existing scripts keep working.
+  --as <email>                 Act as another TimDo account (sends X-Timdo-User with the
+                               internal secret). Also: TIMDO_AS=<email>. Good for previewing
+                               what a collaborator sees, e.g. --as robin@example.com
+  --no-color                   No colour (colour is only used on a terminal; NO_COLOR is respected)
+
+ENVIRONMENT:
+  TIMDO_SECRET, TIMDO_API, TIMDO_AS, TIMDO_CONFIG (default ~/.config/timdo/config).
+  Environment variables override the config file.
+
+TASKS:
+  list [status] [opts]         List tasks (all, do, delay, done, delegate, awaiting)
+                               --mine --unassigned --assignee <who> -w <workspace> -p <project>
+  get <id>                     Task with workspace, project, people, notes and recent activity
+  add "title" -p <project>     Create a task (--assign <who>, --project-id <KEY>, ...)
+  update <id> [opts]           Edit a task (--assign <who>, --claim, --unassign, --done, ...)
+  delete <id>                  Soft-delete a task
+  add-note <id> "note"         Add a dated note signed with your name (alias: log)
+  notes <id>                   Notes with their authors (alias: updates)
+  merge <src> <tgt> [--yes]    Merge source task into target (target survives)
+  link <id> <target> [opts]    Link tasks (--type relates_to|blocks|blocked_by|duplicates)
+  unlink <id> <target>         Remove a link
+  search <query> [opts]        Full-text search (--all, --customer <name>)
+  activity [opts]              Who did what, newest first (--task, --epic, --project, --workspace, -n)
+
+EPICS, GOALS AND OVERVIEWS:
+  epic list|get|add|update|delete   Epics (see: timdo epic --help)
+  goal list [-t type]          Your private life goals
+  audit [--all]                Hygiene check on your own tasks (--all: everything you can edit)
+  customers                    Customers with open counts and their workspaces
+  poster --output <path>       Poster SVG of your own tasks (--type done|active|goals)
+
+WORKSPACES AND SHARING (alias: ws, org):
+  workspace list               Your workspaces with your role, members and projects
+  workspace show <ws>          Members, projects with counts, pending invites
+  workspace share <ws> <email> [--role member|viewer|admin]
+  workspace role <ws> <email> <role>     workspace remove <ws> <email>
+  workspace revoke <ws> <email>          workspace leave <ws>
+  workspace create <name>                workspace add-project <ws> <name>
+  workspace move-project <project> <ws> --yes
+  whoami                       Who the CLI is acting as, and your workspaces
+
+Run `timdo <command> --help` for the options of list, add, update, epic, workspace,
+activity, audit and search.
+
+EXAMPLES:
+  timdo list do --mine
+  timdo list do -w "Migrating Dragons" --assignee robin
+  timdo add "Check inverter firmware" -p Solfit --assign robin@example.com
+  timdo update ea9f --claim --do
+  timdo get ea9f
+  timdo activity --project Solfit -n 10
+  timdo ws share "Migrating Dragons" robin@example.com --role viewer
+  timdo --as robin@example.com list do --mine
+  timdo add "Renew passport" -p Personal --status awaiting --await-until 2026-08-03
+  timdo merge ea9f 1234 --yes
+HELP
+}
+
+case "${1:-help}" in
+  list|ls)             shift; cmd_list "$@" ;;
+  add)                 shift; cmd_add "$@" ;;
+  update)              shift; cmd_update "$@" ;;
+  workspace|workspaces|ws|org|orgs) shift; cmd_workspace "$@" ;;
+  epic|epics)          shift; cmd_epic "$@" ;;
+  goal|goals)          shift; cmd_goal "$@" ;;
+  poster)              shift; cmd_poster "$@" ;;
+  add-note|log)        shift; cmd_add_note "$@" ;;
+  notes|updates)       shift; cmd_notes "$@" ;;
+  delete)              shift; cmd_delete "$@" ;;
+  merge)               shift; cmd_merge "$@" ;;
+  get|show)            shift; cmd_get "$@" ;;
+  search)              shift; cmd_search "$@" ;;
+  audit)               shift; cmd_audit "$@" ;;
+  customers)           shift; cmd_customers "$@" ;;
+  link)                shift; cmd_link "$@" ;;
+  unlink)              shift; cmd_unlink "$@" ;;
+  activity|history)    shift; cmd_activity "$@" ;;
+  whoami|me)           shift; cmd_whoami "$@" ;;
+  help|-h|--help)      cmd_help ;;
+  *) usage_die "Unknown command: $1. Run 'timdo help' for usage." ;;
+esac
