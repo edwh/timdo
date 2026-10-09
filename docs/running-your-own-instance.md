@@ -50,6 +50,7 @@ Worker (`wrangler.toml` `[vars]`):
 | `APP_URL` | `https://timdo.tdobson.net` | public web address; allowed for CORS and used in invite links |
 | `CORS_ORIGINS` | `http://localhost:3000` and `APP_URL` | comma-separated origins that may call the API from a browser |
 | `POSTER_WORK_PROJECTS` | unset | project names for the Wall of Done's work column, in order; unset means "projects in shared workspaces" |
+| `FEATURES` | all on | comma-separated list of the optional features to keep: `goals`, `poster`, `voice`, `gmail`. Anything left out disappears from the web app, and its API routes answer 404 with a plain message |
 | `AI_*` | Groq | see `docs/ai-providers.md` |
 
 Web app (`NEXT_PUBLIC_*`, set at build time):
@@ -64,6 +65,17 @@ Web app (`NEXT_PUBLIC_*`, set at build time):
 | `NEXT_PUBLIC_CREATOR_NAME`, `_BIO`, `_TAGLINE`, `_LINKS` | Tim's | the "Made by" card on the landing page; an empty name hides it |
 
 Everything left unset keeps the original value, so the published instance is unchanged by these settings.
+
+### Switching parts off
+
+TimDo started as one person's life planner, and a team running it for work may not want all of it. `FEATURES` names what to keep:
+
+- `goals`: the Life Goals page, the goal pickers on tasks and epics, and the goals poster.
+- `poster`: the Poster Studio and the Wall of Done and Active Tasks posters.
+- `voice`: the microphone, voice onboarding and the AI routes (see `docs/ai-providers.md`; with no provider configured the microphone is hidden anyway).
+- `gmail`: the Gmail thread fields and links on tasks and notes.
+
+For example `FEATURES = "voice"` leaves a plain shared task board with voice commands. The CLI and MCP server still list every command; one that belongs to a switched-off feature gets the API's "switched off on this instance" answer.
 
 ## Who can do what
 

@@ -35,6 +35,7 @@ INSTANCE_NAME = "TimDo"
 APP_URL = "https://timdo.tdobson.net"            # public web address; invite links and CORS
 # CORS_ORIGINS = "http://localhost:3000,https://timdo.tdobson.net"   # default: localhost + APP_URL
 POSTER_WORK_PROJECTS = "Solfit,Migrating Dragons,Xebit,Mavala,Caving Crew"   # Wall of Done work column; unset = shared workspaces
+# FEATURES = "goals,poster,voice,gmail"   # which optional features are on; leave unset for all of them
 
 # Example for a preview/staging environment (optional)
 # [env.preview]

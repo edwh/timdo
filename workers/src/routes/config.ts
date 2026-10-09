@@ -15,6 +15,7 @@ configApp.get('/', (c) => {
     name: config.name,
     appUrl: config.appUrl,
     inviteBaseUrl: `${config.appUrl}/invite`,
+    features: config.features,
   });
 });
 

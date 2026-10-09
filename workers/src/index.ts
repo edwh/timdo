@@ -5,6 +5,7 @@ import { cors } from 'hono/cors';
 import * as schema from './db/schema';
 import { instanceConfig, type InstanceEnv } from './instance';
 import { combinedAuthMiddleware, internalAuthMiddleware } from './middleware/auth';
+import { requireFeature } from './middleware/features';
 import activityApp from './routes/activity';
 import aiApp from './routes/ai';
 import configApp from './routes/config';
@@ -84,6 +85,13 @@ app.use('/api/v2/ai/*', combinedAuthMiddleware);
 app.use('/api/v2/poster/*', combinedAuthMiddleware);
 app.use('/api/v2/activity/*', combinedAuthMiddleware);
 app.use('/api/v2/activity', combinedAuthMiddleware);
+
+// Features an instance has switched off answer 404 before their routes run.
+app.use('/api/v2/goals/*', requireFeature('goals'));
+app.use('/api/v2/goals', requireFeature('goals'));
+app.use('/api/v2/poster/*', requireFeature('poster'));
+app.use('/api/v2/ai/voice-command', requireFeature('voice'));
+app.use('/api/v2/ai/parse-onboarding', requireFeature('voice'));
 
 // Register route handlers. /config is public; everything else was given auth above.
 app.route('/api/v2/config', configApp);

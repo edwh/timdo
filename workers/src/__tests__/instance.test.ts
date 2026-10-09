@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { describe, expect, it } from 'vitest';
-import { instanceConfig } from '../instance';
+import { instanceConfig, parseFeatures } from '../instance';
+import { requireFeature } from '../middleware/features';
 import configApp from '../routes/config';
 
 describe('instanceConfig', () => {
@@ -11,6 +12,7 @@ describe('instanceConfig', () => {
       appUrl: 'https://timdo.tdobson.net',
       corsOrigins: ['http://localhost:3000', 'https://timdo.tdobson.net'],
       posterWorkProjects: null,
+      features: { goals: true, poster: true, voice: true, gmail: true },
     });
   });
 
@@ -36,6 +38,38 @@ describe('instanceConfig', () => {
   });
 });
 
+describe('feature switches', () => {
+  it('are all on unless FEATURES says otherwise', () => {
+    expect(parseFeatures(undefined)).toEqual({
+      goals: true,
+      poster: true,
+      voice: true,
+      gmail: true,
+    });
+    expect(parseFeatures('voice, Poster')).toEqual({
+      goals: false,
+      poster: true,
+      voice: true,
+      gmail: false,
+    });
+    expect(parseFeatures('')).toEqual({ goals: false, poster: false, voice: false, gmail: false });
+  });
+
+  it('answer 404 with a plain message for a switched-off feature', async () => {
+    const app = new Hono<any>();
+    app.use('/api/v2/goals/*', requireFeature('goals'));
+    app.use('/api/v2/goals', requireFeature('goals'));
+    app.get('/api/v2/goals', (c) => c.json([{ id: 'g1' }]));
+
+    const off = await app.request('/api/v2/goals', {}, { FEATURES: 'poster,voice' });
+    expect(off.status).toBe(404);
+    expect(await off.json()).toEqual({ error: 'Life goals are switched off on this instance' });
+
+    const on = await app.request('/api/v2/goals', {}, {});
+    expect(on.status).toBe(200);
+  });
+});
+
 describe('GET /api/v2/config', () => {
   it('is public and returns names and addresses only', async () => {
     const app = new Hono<any>();
@@ -50,6 +84,7 @@ describe('GET /api/v2/config', () => {
       name: 'Example',
       appUrl: 'https://x.example',
       inviteBaseUrl: 'https://x.example/invite',
+      features: { goals: true, poster: true, voice: true, gmail: true },
     });
   });
 });

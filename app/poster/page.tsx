@@ -26,10 +26,12 @@ import {
   Title,
   Tooltip,
 } from '@mantine/core';
+import { FeatureSwitchedOff } from '../../components/FeatureSwitchedOff';
 import PrintableSvgPoster from '../../components/TimDoPage/PrintableSvgPoster';
 import { generatePosterSvg } from '../../workers/src/services/posterSvgService';
 import { useActiveTasksPoster } from '../hooks/useActiveTasksPoster';
 import { useGoals } from '../hooks/useGoalQueries';
+import { useInstanceConfig } from '../hooks/useInstanceConfig';
 import { useProjects } from '../hooks/useProjectQueries';
 import { useWallOfDonePoster } from '../hooks/useWallOfDonePoster';
 import { PosterCanvas } from './PosterCanvas';
@@ -47,6 +49,7 @@ export default function PosterStudioPage() {
   const [isExportingTiled, setIsExportingTiled] = useState(false);
   const [selectedCategories, setSelectedCategories] = useState<string[]>([]);
   const [doneTimeframe, setDoneTimeframe] = useState<'6m' | '12m' | 'all'>('6m');
+  const { features } = useInstanceConfig();
 
   const categoryFilterOptions = useMemo(() => {
     return selectedCategories.length > 0 ? selectedCategories : undefined;
@@ -254,6 +257,10 @@ export default function PosterStudioPage() {
       : posterType === 'active-tasks'
         ? activeTasksSvgMarkup
         : goalsSvgString || undefined;
+
+  if (!features.poster) {
+    return <FeatureSwitchedOff what="Posters" />;
+  }
 
   return (
     <Container size="xl" py="md">
